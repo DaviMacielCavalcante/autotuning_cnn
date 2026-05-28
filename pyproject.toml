@@ -11,4 +11,5 @@ dependencies = [
     "numpy>=2.4.6",
     "optuna>=4.8.0",
     "polars>=1.41.1",
+    "tensorflow[and-cuda]>=2.21.0",
 ]

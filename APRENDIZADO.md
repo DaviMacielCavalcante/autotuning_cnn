@@ -158,6 +158,101 @@ Esta foi a maior fonte de problemas da sessão. Lições aprendidas:
 - Para usar TF antigo + Python novo, é preciso recriar o venv com Python compatível: `uv venv --python 3.11`.
 - A versão do Python pinada no venv determina o universo de versões de TF disponíveis.
 
+## 15. Loss vs Acurácia
+
+Duas métricas diferentes para coisas diferentes:
+
+- **Acurácia**: fração de acertos (`acertos / total`). Discreta — ou acertou ou errou.
+- **Loss (cross-entropy no caso multiclasse)**: mede o quão errado o modelo está **com peso pela confiança da previsão**. Calcula `-log(p_classe_correta)` por imagem.
+
+Tabela de intuição (probabilidade na classe correta → loss):
+
+| p na classe correta | loss |
+|---|---|
+| 0.99 (certo e confiante) | 0.01 |
+| 0.50 (na dúvida) | 0.69 |
+| 0.10 (errou feio) | 2.30 |
+| 0.01 (super confiante e errado) | 4.60 |
+
+### Por que existem as duas
+
+- A **loss é o que o otimizador minimiza** — gradient descent precisa de uma função contínua e diferenciável; acurácia é discreta e não tem gradiente útil.
+- A **acurácia é só pra humano monitorar** — é a métrica intuitiva.
+- Por isso `EarlyStopping` normalmente monitora `val_loss`, não `val_accuracy`: a loss capta degradação **antes** da acurácia (ver seção 16).
+
+## 16. Interpretando curvas de treino
+
+Quatro padrões clássicos ao plotar `accuracy`/`val_accuracy` e `loss`/`val_loss` por época:
+
+| Padrão visual | Diagnóstico |
+|---|---|
+| Treino e val sobem juntos, gap pequeno | Aprendizado saudável |
+| Treino sobe, val estagna baixa (gap grande) | **Overfitting** |
+| Ambos baixos e estagnados | **Underfitting** |
+| Val loss começa a **subir** enquanto train loss continua descendo | **Overfitting confirmado** |
+
+### Sinal sutil: val_loss subindo com val_accuracy estável
+
+Quando a `val_accuracy` mal mexe mas a `val_loss` sobe ao longo das épocas, o modelo continua acertando a mesma fração de exemplos **mas errando com mais confiança** (dando probabilidade alta para a classe errada).
+
+A acurácia não capta isso porque "errar com 60% de confiança" e "errar com 99% de confiança" contam como 1 erro só. Já a cross-entropy diferencia bastante. Esse é exatamente o tipo de degradação que early stopping com `monitor="val_loss"` consegue interromper a tempo.
+
+## 17. Avaliação no conjunto de teste
+
+- `model.evaluate(df_teste)` retorna `(loss, accuracy)` no dataset informado.
+- Não usa para treinar nem para tunar — só ao final, uma vez, pra reportar o desempenho real.
+- O conjunto de teste deve ser separado **desde o início** (a Lauda enfatiza isso) — usar o teste pra qualquer decisão de modelo polui a métrica final.
+
+## 18. RTX 4060 Ti e CUDA
+
+- Compute capability 8.9 (arquitetura Ada Lovelace) — sem os problemas de Pascal com cuDNN 9.
+- TF 2.18+ + cuDNN 9 roda sem nenhum hack: nem `TF_CUDNN_USE_FRONTEND`, nem `TF_CUDNN_USE_AUTOTUNE`, nem downgrade.
+- Velocidade típica observada: ~11ms/step com batch 16 e imagens 150×150 — épocas de ~8s no dataset Intel (14k imagens).
+- `tf.config.experimental.set_memory_growth(gpu, True)` continua útil pra evitar que o TF aloque toda a VRAM de cara.
+
+## 19. DataFrame de imagens a partir do filesystem
+
+- `pathlib.Path(diretorio).glob("*/*.jpg")` varre subpastas e devolve os paths das imagens.
+- Convenção: o nome da pasta-mãe (`p.parent.name`) é o rótulo da classe.
+- Converter `Path` em `str` antes de jogar no DataFrame — o `tf.data` mais à frente espera strings, não objetos `Path`.
+- O `glob` é I/O sequencial do Python — polars não acelera essa parte. Pra 14k arquivos dá uns ~100ms, não compensa paralelizar.
+
+## 20. Split estratificado nativo em polars com `.over()`
+
+Alternativa elegante ao `sklearn.train_test_split` quando se está no ecossistema polars. A ideia central: usar **window functions** (`.over(col_classe)`) para aplicar uma expressão independentemente dentro de cada classe.
+
+Padrão usado:
+
+```python
+df.with_columns(
+    is_val=(
+        pl.int_range(pl.len()).shuffle(seed=seed)
+        < (pl.len() * frac_val).cast(pl.Int64)
+    ).over("class")
+)
+```
+
+Como funciona:
+- `pl.int_range(pl.len())` gera `0..n-1` (tamanho do grupo).
+- `.shuffle(seed=seed)` embaralha esses índices.
+- `(pl.len() * frac_val).cast(pl.Int64)` calcula o ponto de corte por grupo.
+- O `.over("class")` faz toda a expressão ser avaliada **por classe**, então cada classe tem seu próprio shuffle e corte independente.
+
+Vantagens vs sklearn:
+- Sem conversão pandas↔polars no meio do pipeline.
+- Polars paraleliza naturalmente o cálculo por grupo.
+- Lê-se como "shuffle per class, cut at threshold" — direto.
+
+O mesmo padrão serve para sub-amostragem estratificada (passa o `n_total` desejado e calcula `frac = n_total / len(df)`).
+
+## 21. Type hints e o Pylance no VS Code
+
+- Sem type hints na assinatura, o Pylance marca o parâmetro como `Unknown` e **não autocompleta** os métodos do polars dentro da função.
+- Conserto: anotar tudo (`df: pl.DataFrame`, `frac_val: float`, `-> tuple[pl.DataFrame, pl.DataFrame]`).
+- O Pylance e o **kernel do Jupyter** são processos independentes. O kernel pode estar usando o `.venv` certo (e o código roda), enquanto o Pylance está apontado pra outro Python (sem autocomplete).
+- Como diagnosticar: `print(pl.__file__)` numa célula confirma o kernel; barra de status do VS Code (canto inferior direito) mostra o interpretador do Pylance.
+- Quando troca de interpretador ou adiciona type hints, às vezes é preciso "Python: Restart Language Server" para o Pylance reanalisar.
+
 ---
 
 ## Observações da metodologia da professora
@@ -169,9 +264,15 @@ Esta foi a maior fonte de problemas da sessão. Lições aprendidas:
 
 ---
 
-## Status final da sessão
+## Status atual da sessão
 
-- Pipeline de dados (`image_dataset_from_directory`) **funcionando** no notebook.
-- Modelo baseline montado e compilado.
-- Treino **não rodou** no notebook (GTX 1050 Ti + cuDNN 9 incompatíveis).
-- Decisão: migrar projeto para máquina desktop, onde a GPU é mais nova e o treino pode rodar sem essas limitações.
+- Pipeline de dados (`image_dataset_from_directory`) funcionando.
+- Modelo baseline montado, compilado e treinado: 76.5% no teste, com overfitting forte (train 99% vs val 76%).
+- Curvas de treino + `evaluate` no teste prontos.
+- **Etapa A da pipeline de autotuning iniciada** (preparação dos dados para Optuna):
+  - Passo 1: DataFrame `(path, class)` em polars via `pathlib.glob`. ✓
+  - Passo 2: split estratificado `df_treino` / `df_validacao` (~11227 / ~2807) com window function `.over("class")`. ✓
+  - Passo 3: sub-amostra estratificada `df_treino_tuning` (2997) e `df_validacao_tuning` (597). ✓
+  - Passo 4 (pendente): função `criar_dataset(df, shuffle=)` que converte DataFrame em `tf.data.Dataset`.
+  - Passo 5 (pendente): validação final de contagens por classe.
+- Depois da etapa A: definir `criar_cnn_optuna(trial)`, `objective(trial)` e rodar `study.optimize(n_trials=15)`.

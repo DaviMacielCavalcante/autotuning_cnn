@@ -168,7 +168,7 @@ Duas métricas diferentes para coisas diferentes:
 Tabela de intuição (probabilidade na classe correta → loss):
 
 | p na classe correta | loss |
-|---|---|
+| --- | --- |
 | 0.99 (certo e confiante) | 0.01 |
 | 0.50 (na dúvida) | 0.69 |
 | 0.10 (errou feio) | 2.30 |
@@ -185,7 +185,7 @@ Tabela de intuição (probabilidade na classe correta → loss):
 Quatro padrões clássicos ao plotar `accuracy`/`val_accuracy` e `loss`/`val_loss` por época:
 
 | Padrão visual | Diagnóstico |
-|---|---|
+| --- | --- |
 | Treino e val sobem juntos, gap pequeno | Aprendizado saudável |
 | Treino sobe, val estagna baixa (gap grande) | **Overfitting** |
 | Ambos baixos e estagnados | **Underfitting** |
@@ -233,12 +233,14 @@ df.with_columns(
 ```
 
 Como funciona:
+
 - `pl.int_range(pl.len())` gera `0..n-1` (tamanho do grupo).
 - `.shuffle(seed=seed)` embaralha esses índices.
 - `(pl.len() * frac_val).cast(pl.Int64)` calcula o ponto de corte por grupo.
 - O `.over("class")` faz toda a expressão ser avaliada **por classe**, então cada classe tem seu próprio shuffle e corte independente.
 
 Vantagens vs sklearn:
+
 - Sem conversão pandas↔polars no meio do pipeline.
 - Polars paraleliza naturalmente o cálculo por grupo.
 - Lê-se como "shuffle per class, cut at threshold" — direto.
@@ -253,6 +255,198 @@ O mesmo padrão serve para sub-amostragem estratificada (passa o `n_total` desej
 - Como diagnosticar: `print(pl.__file__)` numa célula confirma o kernel; barra de status do VS Code (canto inferior direito) mostra o interpretador do Pylance.
 - Quando troca de interpretador ou adiciona type hints, às vezes é preciso "Python: Restart Language Server" para o Pylance reanalisar.
 
+## 22. `tf.data.Dataset` é imutável
+
+- Cada método (`.map`, `.shuffle`, `.batch`, `.prefetch`) **devolve um dataset novo**; não muta o original.
+- Bug clássico: `if shuffle: ds.shuffle(1000)` é um no-op silencioso — o resultado é descartado. Tem que reatribuir: `ds = ds.shuffle(1000)`.
+- O padrão idiomático é encadear tudo em uma expressão (`ds.map(...).shuffle(...).batch(...)`), mas isso conflita com chain condicional. Quando precisar de `if`, quebrar a chain e reatribuir é mais legível que ternários inline.
+- Em fluent APIs imutáveis (tf.data, polars, pandas, Spark), ternário no meio de uma chain quase sempre quebra por precedência de operadores.
+
+## 23. Função de carregamento de imagem (`tf.data`)
+
+A função passada ao `.map(...)` roda em **modo grafo** do TF, não em Python normal. Isso significa:
+
+- **Só usar APIs `tf.*`**: `tf.io.read_file`, `tf.image.decode_jpeg`, `tf.image.resize`.
+- **Não usar** `PIL`, `open()`, `cv2`, `print` pra debug — quando muito, usar `tf.print`.
+- A função recebe **tensores**, não strings Python. Por isso o `path` no `from_tensor_slices((paths, labels))` precisa ser passado como lista de strings (não objetos `pathlib.Path`).
+
+Pipeline correto (`Conv2D` espera tensor 3D float32):
+
+```text
+tf.io.read_file(path) → tf.image.decode_jpeg(channels=3) → tf.image.resize(IMG_SIZE)
+```
+
+Erros comuns: pular o `decode_jpeg` e tentar fazer `resize` direto nos bytes brutos (não funciona — `resize` espera tensor de imagem, não buffer).
+
+## 24. Batch Normalization
+
+Camada que normaliza ativações intermediárias batch por batch: para cada feature (canal) na saída da camada anterior, calcula média/desvio dentro do batch, normaliza, e aplica dois parâmetros aprendidos `γ` e `β`.
+
+### Problema que resolve
+
+**Internal covariate shift**: durante o treino, conforme os pesos mudam, a distribuição das ativações que chegam em cada camada interna muda também. Cada camada está perseguindo um alvo móvel. BN estabiliza essa distribuição (média 0, desvio 1) — as camadas seguintes não precisam mais se readaptar a cada passo.
+
+### Ganhos práticos
+
+- Permite learning rate maior (sem explodir gradiente).
+- Convergência mais rápida — frequentemente metade das épocas necessárias.
+- Efeito regularizador leve (média/desvio do batch são amostras ruidosas, atuam como mini-dropout).
+- Menos sensível à inicialização dos pesos.
+
+### Posicionamento canônico (CNN)
+
+```python
+Conv2D(filtros, kernel)        # sem activation
+BatchNormalization()
+Activation("relu")
+MaxPooling2D((2, 2))
+```
+
+**Por que separar a ativação do Conv2D**: BN deve receber a saída **linear** da convolução (antes da não-linearidade). Se `activation="relu"` está dentro do `Conv2D`, a ordem fica `Conv → ReLU → BN`, que é a versão antiga e funciona pior.
+
+### Treino vs inferência
+
+- **Treino**: usa média/desvio do batch atual.
+- **Inferência**: usa média móvel das estatísticas vistas durante o treino. Keras cuida automaticamente — mas é o motivo pelo qual `model.predict(...)` pode dar resultado diferente se você reativar `training=True` manualmente.
+
+## 25. BN exige batch suficiente
+
+Como BN calcula estatísticas dentro do batch, **batch pequeno = estatísticas ruidosas = gradientes instáveis**.
+
+| Batch size | BN |
+| --- | --- |
+| < 16 | Não usar BN puro — preferir LayerNorm ou GroupNorm |
+| 16–32 | Funciona mas com ruído |
+| ≥ 32 | Confortável |
+| ≥ 64 | Ótimo |
+
+Caso observado nesse projeto: baseline rodou com `batch_size=16` (herdado das células iniciais). Sem BN, train_acc chegava em 99% facilmente. Adicionando BN, train_acc travou em ~40% e val_acc em ~49% — bem pior que o baseline sem BN. Subindo `batch_size` pra 32 (valor da tabela da Lauda) destravou o aprendizado.
+
+Lição: **mudar de arquitetura para uma com BN exige revisitar o batch size em paralelo**. As duas escolhas não são independentes.
+
+## 26. Metodologia: comparar baseline e Optuna na mesma arquitetura
+
+A comparação que a Lauda pede ("CNN baseline" vs "CNN otimizada com Optuna") só isola o efeito do tuning **se as duas arquiteturas forem idênticas**. Só os hiperparâmetros mudam.
+
+| Opção | Baseline | Optuna | Compara o quê |
+| --- | --- | --- | --- |
+| A | Sem BN | Sem BN | Efeito do tuning numa rede simples |
+| B | Com BN | Com BN | Efeito do tuning numa rede com BN |
+| Inválida | Sem BN | Com BN | Confunde tuning e BN |
+
+Escolha do projeto: **B** — adiciona BN no baseline e no espaço de busca do Optuna. Custo: re-treinar o baseline (~1–2min). Ganho: arquitetura mais sólida, Optuna pode explorar lr mais alto com segurança, e a comparação fica metodologicamente limpa. Vale documentar essa escolha na seção de análise do notebook.
+
+## 27. `LD_LIBRARY_PATH` via `.env` do VS Code
+
+A seção 6 já cobre o porquê de `LD_LIBRARY_PATH` precisar ser setado **antes** do Python iniciar. Solução sustentável quando o ambiente de desenvolvimento é VS Code:
+
+**Criar `.env` na raiz do projeto** com a variável apontando para as libs CUDA do venv. O VS Code Python extension lê esse arquivo automaticamente antes de subir o kernel Jupyter — não precisa lembrar de exportar nada manualmente.
+
+Comando que gera o `.env` correto:
+
+```bash
+echo "LD_LIBRARY_PATH=$(find $(pwd)/.venv/lib/python3.12/site-packages/nvidia -maxdepth 2 -type d -name lib | tr '\n' ':' | sed 's/:$//')" > .env
+```
+
+Os pacotes nvidia trazem libs em pastas separadas (`cudnn/lib`, `cublas/lib`, `cuda_runtime/lib`, etc.) — todas precisam estar no path. O `find` resolve isso.
+
+### Aplicar a mudança
+
+`.env` é lido na criação do processo Python — **Reload Window** no VS Code (`Ctrl+Shift+P → Developer: Reload Window`), não basta restart kernel.
+
+### Sintomas que indicam que essa é a causa
+
+- `tf.config.list_physical_devices('GPU')` retorna `[]`.
+- `nvidia-smi` mostra a GPU viva e livre.
+- `!echo $LD_LIBRARY_PATH` dentro do notebook retorna vazio.
+- `ls .venv/lib/python3.12/site-packages/nvidia/` lista as libs (sinal de que `tensorflow[and-cuda]` foi instalado corretamente).
+
+Esse quadro apareceu nessa sessão após uma atualização do sistema (driver subiu pra 595, CUDA pra 13.2) — o venv estava intacto, mas o ambiente perdeu a variável.
+
+### Lembrar de versionar
+
+Adicionar `.env` no `.gitignore` se já não estiver — paths absolutos não fazem sentido pra outras máquinas, e arquivos `.env` normalmente carregam secrets.
+
+## 28. `study.best_value` não é o resultado final
+
+Erro de leitura comum depois de rodar `study.optimize`: olhar pra `study.best_value` e achar que é a métrica de qualidade do modelo otimizado. Não é.
+
+`study.best_value` é o melhor `val_accuracy` atingido **na amostra de tuning** (ex: 3000 imagens), com no máximo as `epochs` configuradas no `objective` (ex: 10), e potencialmente com `EarlyStopping` interrompendo antes. É um número de **comparação relativa entre trials**, não a métrica final do modelo.
+
+### O pipeline completo do tuning
+
+```text
+1. Optuna.optimize() na amostra de tuning   → study.best_params
+2. Construir novo modelo com best_params
+3. Treinar esse modelo no dataset CHEIO       (10–14k imagens, 20 épocas)
+4. Avaliar no df_teste (separado desde o início) → métrica final
+```
+
+A Lauda exige explicitamente o passo 3:
+
+> "Após o tuning, a melhor configuração encontrada deverá ser treinada novamente usando o maior conjunto de treino viável, mantendo o teste separado."
+
+### Por que o número final tende a ser maior que `best_value`
+
+- Mais dados (4× mais imagens) reduzem variância.
+- Mais épocas permitem convergência mais completa.
+- O `EarlyStopping` no tuning é agressivo (`patience=3`, max 10 épocas) pra acelerar — no treino final ele tolera mais.
+
+Diferença típica: vencedor no teste fica 5–10 pontos acima de `best_value`.
+
+Sintoma de problema: se `vencedor.evaluate(df_teste)` ≈ `study.best_value`, é sinal de que a arquitetura tem teto baixo (não escala com mais dados) — vale revisitar a estrutura, não os hiperparâmetros.
+
+## 29. Comparação baseline vs Optuna precisa ser na mesma escala
+
+Erro metodológico fácil de cometer: treinar o baseline no dataset cheio (20 épocas) e comparar diretamente com `study.best_value` (3k imagens, 10 épocas com early stopping). Os números **não são comparáveis** — o baseline teve 4× mais dados e o dobro de épocas.
+
+### Duas formas válidas de comparar
+
+**Forma A — Baseline na amostra de tuning (a que a professora usa):**
+
+- Treina baseline em `ds_treino_tuning`/`ds_validacao_tuning` com mesmas épocas e early stopping.
+- Compara `melhor_val_acc_baseline` vs `study.best_value`.
+- Mostra: "o tuning melhorou esse setup específico?"
+
+**Forma B — Vencedor no dataset cheio vs baseline no dataset cheio:**
+
+- Treina o vencedor (com `best_params`) no dataset cheio.
+- Compara `vencedor_test_acc` vs `baseline_test_acc`.
+- Mostra: "o tuning produziu um modelo melhor pro problema real?"
+
+Idealmente reporta as duas — uma valida o processo (tuning melhorou as métricas comparáveis), a outra mede o ganho prático.
+
+### Anti-pattern
+
+Comparar "baseline (cheio, 20 ep) vs Optuna best (3k, 10 ep com early stop)" mistura efeito de tuning com efeito de tamanho de dataset e número de épocas — não dá pra atribuir o gap a nada específico.
+
+## 30. Estrutura completa do notebook (segundo a professora)
+
+Roteiro mínimo pra um trabalho como esse, em ordem de execução:
+
+1. **Imports + reprodutibilidade** (`SEED`).
+2. **Carregar dataset** + DataFrame `(path, classe)`.
+3. **Visualizar amostras** (sanity check).
+4. **Split estratificado** treino / validação / teste (teste separado **desde aqui**).
+5. **Amostra estratificada** pro tuning.
+6. **Pipeline `tf.data`** (`carregar_imagem`, `criar_dataset`).
+7. **Baseline** — treinar na amostra de tuning, mesmas épocas que o Optuna usará.
+8. **Plot curvas baseline** + registrar `melhor_val_acc_baseline`.
+9. **`criar_cnn_optuna(trial)`** — modelo parametrizado.
+10. **`objective(trial)`** — fit na amostra + return `max(val_accuracy)`.
+11. **`study.optimize(n_trials≥15)`** com `TPESampler`.
+12. **Reportar** `study.best_value`, `study.best_params`, `study.trials_dataframe()`.
+13. **Visualizar otimização**: `plot_optimization_history`, `plot_param_importances`.
+14. **Bar chart** comparando baseline vs Optuna (na amostra).
+15. **Construir vencedor** com `best_params`.
+16. **Treinar vencedor** no dataset **cheio** (20 épocas).
+17. **Plot curvas vencedor** + `evaluate` no `df_teste`.
+18. **Matriz de confusão** (`sklearn.metrics.confusion_matrix` + `ConfusionMatrixDisplay`).
+19. **Tabela final** comparando: baseline (tuning), Optuna best (tuning), vencedor (teste).
+20. **Arquitetura clássica** (item 6 da Lauda) — VGG/ResNet/etc. com transfer learning.
+
+Confirmar que **todas as células executam em ordem do zero** antes de entregar — a Lauda exige reprodutibilidade.
+
 ---
 
 ## Observações da metodologia da professora
@@ -260,6 +454,8 @@ O mesmo padrão serve para sub-amostragem estratificada (passa o `n_total` desej
 - Usar DataFrame + `train_test_split` estratificado dá controle estatístico maior do que `image_dataset_from_directory` puro.
 - Splits estratificados são essenciais para classes desbalanceadas.
 - Sub-amostragem estratificada serve para acelerar tuning de hiperparâmetros.
+- Baseline da professora é treinado **na mesma amostra de tuning** para comparação direta com Optuna best (ver §29).
+- A professora usa BN **só no modelo vencedor** (não no baseline) — é a opção "inválida" da §26 do ponto de vista de isolar efeito do tuning, mas é uma escolha metodológica defensável se você documenta. Neste projeto escolhemos opção B (BN nas duas).
 - O resultado dela teve diferença grande entre validação (0.378) e teste (0.267) — sinal de overfitting do tuning numa amostra pequena. Possível ponto de investigação no projeto.
 
 ---
@@ -267,12 +463,16 @@ O mesmo padrão serve para sub-amostragem estratificada (passa o `n_total` desej
 ## Status atual da sessão
 
 - Pipeline de dados (`image_dataset_from_directory`) funcionando.
-- Modelo baseline montado, compilado e treinado: 76.5% no teste, com overfitting forte (train 99% vs val 76%).
-- Curvas de treino + `evaluate` no teste prontos.
-- **Etapa A da pipeline de autotuning iniciada** (preparação dos dados para Optuna):
-  - Passo 1: DataFrame `(path, class)` em polars via `pathlib.glob`. ✓
-  - Passo 2: split estratificado `df_treino` / `df_validacao` (~11227 / ~2807) com window function `.over("class")`. ✓
-  - Passo 3: sub-amostra estratificada `df_treino_tuning` (2997) e `df_validacao_tuning` (597). ✓
-  - Passo 4 (pendente): função `criar_dataset(df, shuffle=)` que converte DataFrame em `tf.data.Dataset`.
-  - Passo 5 (pendente): validação final de contagens por classe.
-- Depois da etapa A: definir `criar_cnn_optuna(trial)`, `objective(trial)` e rodar `study.optimize(n_trials=15)`.
+- Baseline **original** (sem BN, batch 16): 76.5% no teste, overfitting forte (train 99% vs val 76%, val_loss subindo).
+- Baseline **revisado** (com BN, batch 64): travado em ~52% test_acc. Tentativa de retreinar com BN não destravou — o modelo simplesmente não chega na faixa de 99% train que conseguia sem BN. Suspeita: interação BN + XLA + arquitetura simples.
+- **Pipeline de autotuning completo até o `study.optimize`**: split estratificado em polars (`.over("class")`), sub-amostra (3000/600), `create_dataset_for_tf`, `create_optuna_cnn(trial)`, `objective(trial)`, study TPE com 15 trials.
+- **Resultado Optuna**: `best_value = 0.509` (trial 7), todos os trials entre 0.16 e 0.51. Mesmo sintoma do baseline com BN — arquitetura travada.
+- **Problema de GPU resolvido** durante a sessão: depois de uma atualização de driver (595/CUDA 13.2), `tf.config.list_physical_devices('GPU')` voltou `[]` porque o `LD_LIBRARY_PATH` ficou vazio. Resolvido com `.env` na raiz do projeto + Reload Window.
+- **Pendências para fechar o trabalho** (itens 12–20 da §30 acima):
+  - Imprimir `study.best_params` e `study.trials_dataframe()`.
+  - Construir e treinar **modelo vencedor** no dataset cheio.
+  - Avaliar no teste + matriz de confusão.
+  - Visualizações Optuna (`plot_optimization_history`, `plot_param_importances`).
+  - Re-treinar baseline na amostra de tuning para comparação justa (§29).
+  - Tabela final + arquitetura clássica (item 6 da Lauda).
+- **Decisão pendente**: se o vencedor no teste continuar em ~0.50, voltar para opção A (sem BN nas duas arquiteturas) e refazer Optuna — o baseline sem BN tinha 76% test, então tem teto bem maior.

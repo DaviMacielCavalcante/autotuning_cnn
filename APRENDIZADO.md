@@ -334,7 +334,11 @@ A comparação que a Lauda pede ("CNN baseline" vs "CNN otimizada com Optuna") s
 | B | Com BN | Com BN | Efeito do tuning numa rede com BN |
 | Inválida | Sem BN | Com BN | Confunde tuning e BN |
 
-Escolha do projeto: **B** — adiciona BN no baseline e no espaço de busca do Optuna. Custo: re-treinar o baseline (~1–2min). Ganho: arquitetura mais sólida, Optuna pode explorar lr mais alto com segurança, e a comparação fica metodologicamente limpa. Vale documentar essa escolha na seção de análise do notebook.
+Escolha inicial do projeto: **B** — adicionamos BN ao baseline, ao espaço de busca do Optuna e ao modelo vencedor.
+
+**Reversão para A.** Após rodar o pipeline completo com BN, observamos que a camada não estava interagindo bem com a arquitetura escolhida nesse dataset (Intel Image Classification). Voltamos para a opção A nas três funções (`Conv2D(filtros, (3,3), activation="relu")` direto, sem `BatchNormalization()` nem `Activation` separada). O requisito de "1 camada de normalização ou regularização" da Lauda continua atendido pelo `Dropout` no bloco denso.
+
+A nota metodológica fica registrada como markdown no notebook, antes da célula do baseline, pra a professora ver o caminho percorrido.
 
 ## 27. `LD_LIBRARY_PATH` via `.env` do VS Code
 
@@ -420,6 +424,496 @@ Idealmente reporta as duas — uma valida o processo (tuning melhorou as métric
 
 Comparar "baseline (cheio, 20 ep) vs Optuna best (3k, 10 ep com early stop)" mistura efeito de tuning com efeito de tamanho de dataset e número de épocas — não dá pra atribuir o gap a nada específico.
 
+## 30c. Diagnóstico arquitetural: `Flatten → Dense` carrega tudo
+
+Padrão clássico de "CNN ruim" que apareceu nessa sessão. Quando o modelo é:
+
+```text
+Conv2D(32) → Pool → Conv2D(64) → Pool → Flatten → Dense(128) → Dense(num_classes)
+```
+
+Com input (150, 150, 3) e duas Pool 2×2, a saída do segundo MaxPool é `(36, 36, 64)`. `Flatten` cospe **82944 features** num vetor sem estrutura espacial. A `Dense(128)` em cima tem `82944 × 128 ≈ 10.6M` parâmetros — **99% do modelo inteiro**.
+
+### Por que isso quebra
+
+- **A Conv não precisa aprender features semânticas** — ela só precisa fazer "qualquer coisa", e a Dense gigante decora os 10M pesos pra mapear isso pras classes.
+- **Overfitting é certo** quando train_acc passa de 0.90 mas val_acc trava bem abaixo do baseline.
+- **OOM na GPU** com batch razoável + muitos trials Optuna: cada modelo segura ~40MB de pesos + ativações grandes. O `clear_session` libera mas a fragmentação acumula entre trials.
+
+### O fix idiomático: `GlobalAveragePooling2D`
+
+Substituir `Flatten` por `GlobalAveragePooling2D()` muda a entrada da Dense de `36 × 36 × 64 = 82944` para **só `64` features** (uma média escalar por feature map).
+
+| Camada | Antes (Flatten) | Depois (GAP) |
+| --- | --- | --- |
+| Entrada da Dense | 82944 | 64–128 |
+| Params da Dense(128) | 10.616.960 | 8.320 |
+| Total do modelo | ~10.6M | ~28k |
+| Razão | **1300× menor** | |
+
+### Mecânica: o que GAP realmente faz
+
+Considera o tensor que sai do último `MaxPool2D`: shape `(H, W, C)` — por exemplo `(36, 36, 64)`. Isso é um cubo de 64 "fatias" 36×36, onde cada fatia é um **feature map** (quão fortemente o filtro X foi ativado em cada posição).
+
+- **`Flatten`** reorganiza a memória: `(36, 36, 64) → (82944,)`. Sem matemática. Preserva **toda a informação de posição** — você ainda sabe que o pixel (12,7) do filtro 23 está no índice 26591 do vetor.
+- **`GlobalAveragePooling2D`** calcula a média espacial de cada feature map: `(36, 36, 64) → (64,)`. Joga fora **toda a informação de posição** — só sobra "no geral, quão presente foi cada filtro na imagem".
+
+A Dense que vem depois recebe muito menos coisa, mas **mais densa em significado**: cada uma das 64 (ou 128) features representa "ativação média de um conceito" — não pixels nem posições.
+
+### Prós
+
+1. **Força a Conv a fazer o trabalho dela.** Sem a Dense gigante pra compensar preguiça, cada filtro precisa aprender uma feature que faça sentido sozinha. A profundidade da rede passa a importar.
+2. **Translation invariance grátis.** Uma "árvore" no canto superior ativa o filtro "folhagem" igualzinho a uma árvore no canto inferior — a média não muda. Pra classificar paisagens (Intel: floresta, montanha, mar, rua, prédios, geleira) isso é exatamente o desejado: a categoria depende do *conteúdo*, não da *posição*.
+3. **Muito menos parâmetros → menos overfitting.** 10M → 28k no modelo total. Com 11k imagens de treino, isso muda o regime do problema.
+4. **Resolve OOM em runs longos.** Activations gigantes no Flatten são liberadas a cada trial mas fragmentam VRAM. GAP elimina o problema.
+5. **A Dense vira o que ela é boa.** Dense não tem viés indutivo pra imagem; era inadequada pra raciocínio espacial e adequada pra raciocínio semântico em cima de features já abstraídas. Agora ela só faz a parte boa.
+6. **É o padrão das CNNs modernas.** ResNet, Inception, EfficientNet, MobileNet — todas usam GAP. `Flatten + Dense gigante` em classificação é considerado legado.
+
+### Contras / o que se perde
+
+1. **Descarta toda a informação de posição.** Se a tarefa de classificação dependesse de **onde** algo está na imagem, GAP seria ruim. Exemplos:
+   - "Tem ônibus à esquerda da imagem?" — GAP destruiria essa distinção.
+   - Counting tasks ("quantas pessoas estão na imagem?") — número, não presença/ausência.
+   - Tarefas de detecção (`object detection`, `segmentation`) — precisam de posição, e por isso usam arquiteturas diferentes (não terminam com GAP).
+2. **Pode "deixar dinheiro na mesa" em datasets onde Dense gigante decora bem.** Em problemas com **muitos** dados (ImageNet de verdade, milhões de imagens), a Dense gigante consegue aprender combinações espaciais sem overfittar, e Flatten pode dar resultado bruto melhor. Em 11k imagens é o oposto.
+3. **Mais difícil de aprender com poucos dados E pouca profundidade.** A conv tem que carregar todo o trabalho semântico. Com só 2 blocos Conv+Pool, pode ser que o modelo nem consiga representar conceitos suficientemente abstratos. Esse é o motivo de §30c geralmente vir junto com "adicionar mais blocos Conv" (3º e 4º bloco) — uma coisa habilita a outra.
+
+### Quando escolher Flatten vs GAP
+
+| Cenário | Use |
+| --- | --- |
+| Classificação onde categoria depende de conteúdo geral | **GAP** |
+| Classificação com dataset pequeno (< 50k imagens) | **GAP** |
+| Modelo profundo (4+ blocos Conv) com pouca regularização | **GAP** |
+| Tarefa que depende de posição (esquerda/direita, contagem) | **Flatten** ou outra arquitetura |
+| Pouquíssimas camadas Conv (1–2) **e** dataset enorme | Flatten pode ser melhor |
+
+### Onde mais aparece esse problema
+
+Sempre que você ver, no `model.summary()`, uma camada Dense logo após Flatten com **mais de 1M parâmetros**, é cheiro forte de capacidade ociosa. Vale considerar GAP, especialmente se o modelo está overfittando ou se você está perto do limite de VRAM.
+
+### Decisão deste projeto
+
+Substituir `Flatten` por `GAP` nas três funções (baseline, `create_optuna_cnn`, `create_cnn_with_params`). Justificativa para a análise da Lauda:
+
+- Categoria depende do conteúdo geral da paisagem, não de posição → GAP é adequado.
+- Dataset relativamente pequeno (~11k train) → menos params = menos overfit.
+- `Flatten + Dense(82944→128)` causou `ResourceExhaustedError` em runs longos do Optuna e degeneração do modelo vencedor (cf. §28, §30b).
+- A camada de pooling no fim mantém a estrutura "Conv → Pool" do baseline, então a comparação metodológica (baseline vs Optuna) continua dentro da mesma família arquitetural.
+
+### Resultado observado isoladamente
+
+Aplicar GAP **sem** outras mudanças levou a:
+
+- **Baseline (sem tuning)**: subiu de val_acc ~0.78 (Flatten) para ~0.74 (GAP). Caiu um pouco, mas ainda funciona porque a Dense(128) padrão consegue extrair sinal das 64 features médias.
+- **Optuna na amostra**: `best_value` desabou de ~0.73 pra ~0.41. Trials variando entre 0.18 e 0.41 — Optuna não conseguiu achar configuração que rende com tão pouca capacidade convolucional.
+- **Vencedor no dataset cheio**: val_acc grudou em 0.179 (random pra 6 classes) ao longo das 20 épocas — colapso total.
+
+**Diagnóstico:** sintoma do "Contras item 3" — GAP com só 2 blocos Conv é raso demais. Com Flatten, a Dense gigante compensava; com GAP, a profundidade da Conv precisa subir.
+
+## 30d. Profundidade suficiente: 3º e 4º blocos Conv
+
+GAP só funciona se a Conv aprender features semânticas. Isso requer **profundidade**: cada bloco `Conv+Pool` reduz a resolução espacial pela metade e dobra (idealmente) o número de filtros — esse é o padrão "feature pyramid" que aparece em qualquer CNN moderna.
+
+### O padrão clássico de pyramid
+
+```text
+Bloco 1: Conv(32)  + Pool   →  150 × 150 → 74 × 74
+Bloco 2: Conv(64)  + Pool   →   74 × 74  → 36 × 36
+Bloco 3: Conv(128) + Pool   →   36 × 36  → 17 × 17
+Bloco 4: Conv(256) + Pool   →   17 × 17  → 7 × 7
+GlobalAveragePooling2D       →   7 × 7   → (256,)
+Dense(128) → Dropout → Dense(num_classes, softmax)
+```
+
+Cada bloco aprende features mais abstratas que o anterior:
+
+- Bloco 1: bordas, gradientes de cor, texturas locais.
+- Bloco 2: combinações simples (cantos, contrastes, padrões repetitivos).
+- Bloco 3: partes de objetos (folhagem, superfícies brilhantes, estruturas verticais).
+- Bloco 4: conceitos semânticos (paisagem boscosa, paisagem urbana, paisagem aquosa).
+
+GAP no fim só funciona se o Bloco 4 estiver carregando significado — caso contrário ele só agrega ruído.
+
+### Por que dobrar filtros é regra geral
+
+- Cada Pool reduz pela metade a quantidade de "posições" no mapa, ou seja, a quantidade de informação espacial cai 4×.
+- Para compensar, dobramos o número de filtros — a "largura" da representação cresce enquanto a "altura/largura" diminui.
+- Resultado: o volume de informação (filtros × spatial) fica relativamente constante por bloco, mas mais abstrato.
+
+### Custo
+
+- ~4× mais params na Conv (32 → 64 → 128 → 256 acumula 388k params na Conv).
+- ~3× mais tempo por época (mais multiplicações).
+- Ainda assim, modelo total fica em ~420k params — muito menos que os 10.6M do Flatten+Dense original.
+
+### Decisão de manter blocos 3 e 4 fixos
+
+- A Lauda só define ranges pros 2 primeiros (`num_filtros_1`, `num_filtros_2`).
+- Adicionar `num_filtros_3` e `num_filtros_4` ao espaço de busca expandiria o problema (5 → 7 dimensões), e com 20 trials o TPE já está no orçamento mínimo.
+- Fixando em 128 e 256, mantemos a coerência da pyramid e deixamos o Optuna focado nos hiperparâmetros que a Lauda especifica.
+- Justificativa pra análise: "Conforme permitido pela Lauda, ampliamos a arquitetura com 2 blocos convolucionais adicionais (fixos em 128 e 256 filtros, seguindo o padrão feature pyramid). O Optuna continua tunando exatamente os 5 hiperparâmetros especificados pela Lauda."
+
+## 30e. Data augmentation como camadas Keras
+
+Augmentation moderna em Keras é feito com **camadas dentro do modelo**, não com `ImageDataGenerator` externo. Vantagens:
+
+- A augmentation roda na **GPU** junto com o treino (não no CPU), sem overhead.
+- O modelo carrega a augmentation como parte da sua definição — `model.save` preserva tudo.
+- Comportamento "treino vs inferência" é automático: as camadas só transformam imagens quando `training=True` (durante `model.fit`). Em `evaluate` e `predict` viram identidade (no-op).
+
+### As 3 escolhidas para esse projeto
+
+```python
+keras.layers.RandomFlip("horizontal"),
+keras.layers.RandomRotation(0.1),
+keras.layers.RandomZoom(0.1),
+```
+
+| Layer | Efeito | Por que vale para paisagens |
+| --- | --- | --- |
+| `RandomFlip("horizontal")` | Espelha lado-a-lado com prob 0.5 | Floresta/montanha/mar espelhados continuam sendo a mesma categoria |
+| `RandomRotation(0.1)` | Rotaciona ±36° aleatoriamente | Simula pequenas variações de ângulo de captura |
+| `RandomZoom(0.1)` | Zoom in/out até ±10% | Simula distância de captura diferente |
+
+### O que foi deixado de fora e por quê
+
+- **`RandomFlip("vertical")`**: paisagem invertida (céu embaixo) não existe no dataset.
+- **`RandomBrightness` / `RandomContrast`**: o Intel já tem variação natural alta (manhã/tarde, ensolarado/nublado). Adicionar pode ser ruído sem ganho.
+- **`RandomCrop`**: corta partes da imagem. Em paisagens, a categoria pode depender de elementos pequenos (uma trilha urbana = rua); cortar pode mudar o conteúdo significativamente.
+
+### Posicionamento no pipeline
+
+Augmentation entra **antes do `Rescaling`**, no início do Sequential:
+
+```python
+Sequential([
+    Input(shape=(H, W, 3)),
+    keras.layers.RandomFlip(...),
+    keras.layers.RandomRotation(...),
+    keras.layers.RandomZoom(...),
+    Rescaling(1./255),
+    Conv2D(...),
+    ...
+])
+```
+
+A ordem importa: aug em pixels uint8 [0, 255] preserva a semântica visual; aug em pixels normalizados pode introduzir artefatos numéricos sutis em alguns casos.
+
+### Efeito esperado
+
+- Train_acc cresce **mais devagar** por época (o modelo vê dados ligeiramente diferentes a cada vez).
+- Val_acc cresce **mais rápido relativa ao train** (gap menor → menos overfit).
+- Train_acc final fica abaixo do que seria sem aug (não passa de 90–95% tipicamente).
+- Custo de tempo: ~5–15% mais lento por época.
+
+### Por que ajuda especificamente o Optuna
+
+Trials com hiperparâmetros instáveis (lr extremo, dropout muito baixo) tendem a se beneficiar de "decorar" amostras específicas. Com augmentation, **as amostras mudam de época pra época**, então decoração não é viável — o TPE acaba descartando essas regiões patológicas naturalmente.
+
+## 30f. `padding="same"` vs `padding="valid"` em Conv2D
+
+### O que mudam
+
+Por default, `Conv2D` usa `padding="valid"`:
+
+- Não adiciona zeros nas bordas.
+- A saída é **menor** que a entrada: para kernel 3×3, perde 2 pixels (1 de cada lado).
+
+Com `padding="same"`:
+
+- Adiciona zeros nas bordas pra a saída ter o mesmo tamanho da entrada.
+- Para kernel 3×3, adiciona 1 zero de cada lado.
+
+### Impacto acumulado
+
+Em uma rede com 4 blocos Conv 3×3 + Pool 2×2, input 150×150:
+
+**Com `padding="valid"`:**
+
+```text
+150 → Conv(3): 148 → Pool: 74
+ 74 → Conv(3):  72 → Pool: 36
+ 36 → Conv(3):  34 → Pool: 17
+ 17 → Conv(3):  15 → Pool: 7
+```
+
+**Com `padding="same"`:**
+
+```text
+150 → Conv(3): 150 → Pool: 75
+ 75 → Conv(3):  75 → Pool: 37
+ 37 → Conv(3):  37 → Pool: 18
+ 18 → Conv(3):  18 → Pool: 9
+```
+
+8 pixels de informação perdidos no `valid`. Pra paisagens, isso retira informação da **borda**, onde tipicamente fica o céu, o horizonte, e o canto das construções — feature relevante.
+
+### Custo do `same`
+
+- Computacionalmente quase igual (zeros são baratos).
+- Mantém a relação 1:1 entre entrada e saída de cada Conv, o que facilita raciocinar sobre shapes.
+
+### Quando usar
+
+- **`same`** é o padrão em CNNs modernas (ResNet, EfficientNet) — facilita stack profundo sem ter que ajustar cada camada.
+- **`valid`** ainda tem uso quando você quer **forçar redução de dimensão** sem precisar de Pool — útil em alguns designs específicos, mas raro hoje.
+
+Para esse projeto, `same` é a escolha óbvia: mais informação, menos surpresa nas dimensões, custo zero.
+
+## 30g. Restringir o search space do Optuna quando ele converge para regiões patológicas
+
+A Lauda permite "ampliar ou restringir os intervalos sugeridos, justificando a necessidade". Em vez de deixar o TPE explorar regiões que sabidamente quebram, o que é mais produtivo é **cortar fora** essas regiões — o orçamento de trials fica focado em configurações com chance real.
+
+### Sintomas que indicam search space mal calibrado
+
+1. **Configurações ganhadoras na amostra não generalizam para o full data** — sinal típico de overfit na amostra, geralmente associado a regularização baixa (dropout no extremo inferior).
+2. **`best_value` fica abaixo do baseline com hiperparâmetros padrão** — Optuna não está explorando direito; o problema pode ser que os ranges incluam regiões onde nada converge bem.
+3. **Trials concentrados em uma "região" do espaço** — TPE convergiu para um ponto, mas esse ponto é ruim. Restringir tira o ponto ruim do mapa.
+
+### Cortes aplicados neste projeto
+
+**`dropout_rate`: `[0.1, 0.5]` → `[0.2, 0.5]`**
+
+Em todas as rodadas anteriores, o Optuna escolhia dropout=0.1 (mínimo do range) como o "melhor" na amostra. Mecanismo: dropout baixo permite o modelo memorizar 5000 imagens em poucas épocas, dando val_acc alto na amostra. Mas no dataset cheio (11k), o modelo overfitta e val despenca.
+
+Removendo `0.1` do range, forçamos configurações com regularização mínima de `0.2`. Justificativa pra análise: "o extremo inferior do range mostrou-se patológico empiricamente — modelos com dropout 0.1 colapsavam no treino final, não generalizando da amostra para o full data".
+
+**`learning_rate`: `[1e-4, 1e-2]` (log) → `[3e-4, 5e-3]` (log)**
+
+Dois problemas opostos nos extremos:
+
+- **Lr ≈ 1e-4**: convergência muito lenta. Com 15 épocas e early stopping `patience=5`, o modelo mal começa a aprender antes do TPE encerrar o trial. Reportava val_acc baixo não porque a configuração era ruim, mas porque não houve tempo de treinar.
+- **Lr ≈ 1e-2**: oscilação. Modelo "salta" pelo loss landscape e early stopping aborta no ponto mais baixo do ruído, que não reflete a configuração de fato.
+
+Restringir para `[3e-4, 5e-3]` mantém a faixa onde o baseline (lr=0.001) já demonstrou estabilidade — é uma janela ~1.5 décadas em log-scale, ainda significativa para o TPE explorar.
+
+### Ajuste paralelo do regime de treino do trial
+
+Mudanças complementares no `make_objective`:
+
+- `epochs` por trial: `10 → 15` (limite da Lauda).
+- `patience` do EarlyStopping: `3 → 5`.
+
+Justificativa: com lrs menos extremos (cortados pelo passo anterior), o modelo precisa de mais épocas pra atingir o pico de val_acc. Patience maior tolera as flutuações naturais sem cortar antes do tempo.
+
+### Como justificar a restrição na análise da Lauda
+
+Não é "trapaça" — a Lauda explicita que a equipe pode ampliar ou restringir. O importante é:
+
+1. **Documentar** que os ranges foram restringidos.
+2. **Justificar** com base em observação empírica (não em palpite).
+3. **Citar a regra da Lauda** que permite isso.
+
+Texto sugerido para a análise:
+
+> "Após observar que rodadas anteriores do Optuna convergiam consistentemente para `dropout_rate=0.1` (mínimo do range sugerido) com colapso do vencedor no full data, e que learning rates próximos aos extremos (1e-4 e 1e-2) não convergiam dentro do orçamento de épocas, restringimos os ranges para `dropout_rate ∈ [0.2, 0.5]` e `learning_rate ∈ [3e-4, 5e-3]`. Conforme permitido pela Lauda, justificamos a necessidade com base na instabilidade empírica observada nos extremos originais."
+
+### Quando NÃO restringir
+
+- Se o `best_value` está próximo do baseline e os trials estão dispersos pelo espaço, deixe o TPE explorar.
+- Se apenas 1 ou 2 trials caíram em regiões ruins, é normal — o TPE aprende e descarta. Restringir prematuramente reduz a chance de descobertas inesperadas.
+
+Restringir é solução para padrões **consistentes** em múltiplas rodadas, não para uma única observação ruim.
+
+## 30h. Trocar o objetivo do Optuna para `min(val_loss)` + adicionar pruner
+
+A escolha da métrica do `objective` afeta diretamente que tipo de configuração o TPE prefere. Em rodadas anteriores com `return max(history.history["val_accuracy"])` observamos que:
+
+1. **Acurácia é discreta** (acertou/errou). Uma única época sortuda com val_acc inflado por ruído amostral inflava o `study.best_value` da trial inteira.
+2. **TPE acumulava trials sortudos**, escolhendo regiões do espaço onde o pico isolado era alto mesmo sem o trial treinar bem em geral.
+3. **Vencedor escalado pro full data colapsava** — as configurações "sortudas" na amostra não tinham fundamento real.
+
+### A mudança: `min(val_loss)` com `direction="minimize"`
+
+```python
+# antes
+return max(history.history["val_accuracy"])
+
+# depois
+return min(history.history["val_loss"])
+```
+
+E no `create_study`:
+
+```python
+# antes
+study = create_study(direction="maximize", ...)
+
+# depois
+study = create_study(direction="minimize", ...)
+```
+
+### Por que loss é melhor para selecionar trials
+
+- **Suave**: cada amostra contribui com `-log(p_correto)` que varia continuamente conforme as probabilidades mudam. Não há "saltos" de acurácia (de 60% pra 67%, por exemplo).
+- **Reflete confiança da previsão**: um modelo certo com 60% de probabilidade e outro certo com 99% têm a mesma acurácia mas losses muito diferentes (`0.51` vs `0.01`). Selecionar pelo segundo é mais informativo.
+- **Coerência com o regime de parada**: o `EarlyStopping` já monitora `val_loss`. Ter o `objective` retornando outra coisa criava incoerência — o trial parava por uma razão e era avaliado por outra.
+
+### Adicionando o pruner
+
+Pruners permitem abortar trials ruins no meio do treino, sem desperdiçar épocas. O padrão mais útil é o `MedianPruner`:
+
+```python
+pruner = optuna.pruners.MedianPruner(
+    n_startup_trials=5,   # primeiros 5 trials rodam até o fim, sem prune
+    n_warmup_steps=2,     # cada trial roda pelo menos 2 épocas antes de poder ser podada
+)
+study = create_study(direction="minimize", sampler=sampler, pruner=pruner)
+```
+
+**Como funciona internamente:** depois de cada época, comparamos a val_loss atual com a mediana das losses das trials anteriores na mesma época. Se estiver acima da mediana (pior), o trial é abortado.
+
+Para isso funcionar, o objective precisa **reportar a val_loss por época** e **checar should_prune**. Isso é feito via callback Keras:
+
+```python
+class OptunaPruningCallback(keras.callbacks.Callback):
+    def __init__(self, trial):
+        super().__init__()
+        self.trial = trial
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_loss = logs.get("val_loss")
+        if val_loss is None:
+            return
+        self.trial.report(val_loss, epoch)
+        if self.trial.should_prune():
+            raise optuna.TrialPruned()
+```
+
+O `raise optuna.TrialPruned()` é a forma idiomática de sinalizar pro Optuna que o trial foi abortado (não falhou). O Optuna registra isso no histórico e aprende a evitar regiões similares no próximo trial.
+
+### Trade-off do pruner
+
+- **Ganho**: orçamento de tempo se concentra em trials promissores. Em uma run de 20 trials, normalmente 5–8 são podadas, economizando 30–50% do tempo total.
+- **Risco**: trials podadas cedo podem ter sido "lentas pra começar mas boas no final". Os `n_warmup_steps=2` mitigam isso.
+- **Sintoma de pruner agressivo demais**: muitas trials com `state="PRUNED"` na `study.trials_dataframe()`, especialmente nas primeiras 2 épocas. Aí relaxar `n_warmup_steps=3` ou usar `HyperbandPruner` (que tem schedule mais sofisticado).
+
+### Interpretando `study.best_value` depois da mudança
+
+Antes: `best_value` era val_acc — quanto **maior**, melhor (próximo de 1).
+Depois: `best_value` é val_loss — quanto **menor**, melhor (próximo de 0).
+
+Pra reportar de forma comparável na tabela final, vale converter para acurácia rodando uma avaliação no melhor modelo, ou ler a `val_accuracy` da época correspondente no `history`.
+
+### Quando NÃO mudar para min(val_loss)
+
+- Se sua loss não é proporcional ao que você quer otimizar (ex: tarefa onde a métrica é F1 e a loss é cross-entropy multilabel ruidosa).
+- Se você tem motivos pra preferir o "pico de performance" sobre a "qualidade média" — competições onde só o melhor número conta, por exemplo.
+
+Pra trabalhos acadêmicos com objetivo de generalização honesta, `min(val_loss)` é quase sempre a escolha melhor.
+
+## 30i. Catastrophic forgetting por shuffle insuficiente em pipeline polars
+
+**O bug que estava causando o colapso do vencedor em todas as iterações arquiteturais.** Foi identificado por experimento controlado (re-treinar o baseline na mesma arquitetura, mas com os dados polars em vez de `image_dataset_from_directory`). Baseline normalmente em test_acc 0.82 caiu para 0.31 — confirmando que **o problema é o pipeline polars, não a arquitetura nem o Optuna**.
+
+### Estratificação ≠ ordem aleatória (a confusão central)
+
+São duas propriedades **independentes** de um split:
+
+| Propriedade | Definição | Estava correta? |
+| --- | --- | --- |
+| **Estratificação** | Cada classe está no conjunto na proporção que estava no dataset original. | ✅ sempre esteve. `stratified_split` garantiu. |
+| **Ordem aleatória das linhas** | A ordem das linhas no DataFrame é aleatória, sem agrupar classes contíguas. | ❌ nunca esteve. `Path.glob` + `.over("class")` preservavam ordem alfabética por classe. |
+
+Você pode ter um dataset perfeitamente estratificado **em ordem ordenada por classe** (foi o nosso caso) ou um perfeitamente estratificado **em ordem aleatória** (o que queríamos). Estratificação só garante proporção, não embaralhamento.
+
+Confundir as duas é o que custou 7 iterações neste projeto: o split parecia "OK porque era estratificado", então procuramos o bug em todos os outros lugares. A ordem das linhas é tão básica que mal a auditamos.
+
+### A cadeia que causa o bug
+
+1. **`Path.glob("*/*.jpg")`** retorna paths em ordem alfabética por subdiretório: primeiro todos os arquivos de `buildings`, depois todos de `forest`, etc. Resultado: o DataFrame `df_train_full` fica em ordem `[buildings × 2191, forest × 2271, glacier × 2404, mountain × 2512, sea × 2274, street × 2382]` — **grupos contíguos por classe**.
+
+2. **`stratified_split`** filtra com `.over("class")` mas **preserva a ordem original** das linhas. O train_df resultante mantém a estrutura por classe: todos os ~1750 buildings, depois ~1817 forest, etc.
+
+3. **`create_dataset_for_tf`** fazia:
+
+   ```python
+   ds = tf.data.Dataset.from_tensor_slices((paths, labels)).map(load_image, ...)
+   if shuffle:
+       ds = ds.shuffle(1000)
+   ```
+
+   `from_tensor_slices` cria o dataset na ordem do DataFrame — grupos por classe. O `.shuffle(1000)` tem buffer de 1000 amostras, **menor que o tamanho de cada grupo de classe (~1800)**. Resultado: o shuffle só consegue misturar **dentro da classe atual**, não entre classes.
+
+4. **Modelo treina vendo uma classe de cada vez**: ~1800 imagens de buildings em sequência, depois ~1800 de forest, etc. Cada bloco de batches é de uma classe só.
+
+5. **Adam ajusta os pesos para a classe atual**. Como o gradiente vem todo da mesma classe por muitos batches consecutivos, o modelo "esquece" o que aprendeu sobre as classes anteriores — *catastrophic forgetting*.
+
+6. **No fim da época, o modelo só sabe a última classe vista** (street, por ordem alfabética). Validação corre na mesma ordem alfabética; modelo prevê majoritariamente "street" para tudo → val_acc trava em ~0.17–0.33 (random ponderado pela proporção de street + classes próximas).
+
+### Por que `image_dataset_from_directory` funciona
+
+`image_dataset_from_directory(..., shuffle=True)` (default) usa um buffer **proporcional ao dataset** (10k+ pra 14k imagens). Isso é suficiente pra misturar entre classes. O baseline treinado nessa pipeline atinge 0.82 normalmente.
+
+### O fix em `create_dataset_for_tf`
+
+Embaralhar o **DataFrame polars** antes de criar o `tf.data.Dataset`:
+
+```python
+if shuffle:
+    df_labeled = df_labeled.sample(fraction=1.0, shuffle=True, seed=seed)
+```
+
+`df.sample(fraction=1.0)` devolve todas as linhas em ordem aleatória. O `seed` deixa determinístico. Depois disso, manter o `.shuffle(1000)` no tf.data como shuffle entre épocas é OK — não é mais o único shuffle, é só uma camada extra de variação.
+
+### Sintomas que indicam esse bug em outros projetos
+
+- Train_acc sobe normalmente, val_acc trava em ~`1/num_classes` ou em uma fração fixa.
+- Val_acc é igual desde a primeira época — não responde a treinamento.
+- Val_loss alta (~`-log(1/num_classes) × 2-3`), indicando previsões confiantes mas erradas.
+- Modelo treinado com `image_dataset_from_directory` funciona, mas com pipeline customizado falha — diferença está na qualidade do shuffle.
+- O sintoma é **mais comum do que parece** em pipelines onde alguém pega dados ordenados por classe (típico de `Path.glob`, `os.listdir`, listagens de banco) e converte direto pra `tf.data` ou `DataLoader` sem shuffle full.
+
+### A lição
+
+`tf.data.Dataset.shuffle(buffer_size)` **só mistura dentro do buffer**. Se os dados estão ordenados por classe e cada classe tem mais elementos que o buffer, o shuffle não resolve. **Sempre embaralhe os dados de origem antes de construir o pipeline tf.data**, especialmente quando vier de fontes que naturalmente agrupam por classe (filesystem, grouping de DataFrame, etc.).
+
+### Custo do diagnóstico
+
+7 iterações arquiteturais (BN, GAP, 4 Conv, augmentation, padding="same", Categoria A, Categoria B) tentando consertar um sintoma que era **um bug no pipeline de dados**. A lição meta: quando uma intervenção repetidamente não funciona e o sintoma persiste idêntico, é sinal forte de que **a causa está em outro lugar** — vale parar de iterar e fazer um experimento controlado.
+
+O experimento que resolveu (treinar baseline no pipeline suspeito) é o padrão "**isolar a variável**" da metodologia científica básica. Custou 1 minuto de execução e eliminou 6 hipóteses erradas em uma única medição.
+
+## 30b. Treino do vencedor precisa replicar o regime de parada do `objective`
+
+O `study.best_value` que o Optuna reporta é o **pico de `val_accuracy`** atingido durante o `model.fit` do trial, **com os pesos do pico restaurados** (porque o `objective` usa `EarlyStopping(restore_best_weights=True)` e retorna `max(history.history["val_accuracy"])`).
+
+Quando o treino final do vencedor é feito **sem early stopping** e por **mais épocas** que o trial, ele segue treinando além do pico, perde os bons pesos, e o `evaluate` mede um modelo já degradado. Não é problema da arquitetura nem dos hiperparâmetros — é o regime de parada que mudou.
+
+### Caso observado nessa sessão
+
+Trial vencedor (lr=0.000388, dropout=0.1, dense=192) reportou `val_acc=0.6951` na amostra de tuning.
+
+Vencedor treinado por 20 épocas **sem callback** no dataset cheio:
+
+| Época | train_acc | val_acc | val_loss |
+| --- | --- | --- | --- |
+| 1 | 0.77 | ~0.65 (esperado) | ~1.0 |
+| 4–6 | ~0.85 | pico ~0.65–0.70 | mínimo |
+| 9–20 | 0.85→0.91 | colapsa para 0.33–0.35 | sobe pra 3–5 |
+
+`evaluate` no teste: 0.3517 — bem abaixo do pico que o Optuna tinha medido.
+
+### Regra prática
+
+Qualquer parâmetro de regime de parada usado no `objective` (`epochs`, `callbacks`, `patience`, `restore_best_weights`) precisa ser **replicado ou estendido conservadoramente** no treino final:
+
+- `EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)`: replicar.
+- `epochs` pode ser **maior** no treino final (mais dados → mais tempo até overfit), mas o early stopping garante que não passe do ponto.
+- `restore_best_weights=True` é especialmente importante — sem isso, mesmo com early stopping, você fica com os pesos do momento em que parou, não do pico.
+
+### Como diagnosticar quando aparece
+
+Sintomas típicos de "vencedor sem early stopping":
+
+- Train_acc continua subindo até o fim das épocas.
+- Val_acc estabiliza em valor bem abaixo do pico ou colapsa cedo.
+- Val_loss sobe enquanto train_loss desce (cf. §16).
+- `evaluate` no teste fica muito abaixo do `study.best_value`.
+
+Quando todos os quatro aparecem juntos, **não é a arquitetura nem o `best_params` ruim** — é o regime de parada que ficou inconsistente entre `objective` e treino final.
+
 ## 30. Estrutura completa do notebook (segundo a professora)
 
 Roteiro mínimo pra um trabalho como esse, em ordem de execução:
@@ -463,16 +957,81 @@ Confirmar que **todas as células executam em ordem do zero** antes de entregar 
 ## Status atual da sessão
 
 - Pipeline de dados (`image_dataset_from_directory`) funcionando.
-- Baseline **original** (sem BN, batch 16): 76.5% no teste, overfitting forte (train 99% vs val 76%, val_loss subindo).
-- Baseline **revisado** (com BN, batch 64): travado em ~52% test_acc. Tentativa de retreinar com BN não destravou — o modelo simplesmente não chega na faixa de 99% train que conseguia sem BN. Suspeita: interação BN + XLA + arquitetura simples.
-- **Pipeline de autotuning completo até o `study.optimize`**: split estratificado em polars (`.over("class")`), sub-amostra (3000/600), `create_dataset_for_tf`, `create_optuna_cnn(trial)`, `objective(trial)`, study TPE com 15 trials.
-- **Resultado Optuna**: `best_value = 0.509` (trial 7), todos os trials entre 0.16 e 0.51. Mesmo sintoma do baseline com BN — arquitetura travada.
+- **Histórico do baseline em duas rodadas**:
+  - Original (sem BN, batch 16): 76.5% no teste, overfitting forte (train 99% vs val 76%, val_loss subindo).
+  - Tentativa com BN, batch 64: resultados inconsistentes em runs separadas (0.515 numa, 0.752 noutra). O melhor trial Optuna nessa arquitetura ficou em 0.631 (amostra), mas o vencedor escalou para 0.367 no dataset cheio — caso clássico de §28 (`best_value` na amostra não escalou).
+- **Reversão para opção A confirmada**: BN removido das três funções (baseline, `create_optuna_cnn`, `create_cnn_with_params`). Nota metodológica adicionada como markdown no notebook.
+- **Pipeline de autotuning completo até o `study.optimize`**: split estratificado em polars (`.over("class")`), sub-amostra (~3000/~600), `create_dataset_for_tf`, `create_optuna_cnn(trial)`, `objective(trial)` com `EarlyStopping`, study TPE com 15 trials.
 - **Problema de GPU resolvido** durante a sessão: depois de uma atualização de driver (595/CUDA 13.2), `tf.config.list_physical_devices('GPU')` voltou `[]` porque o `LD_LIBRARY_PATH` ficou vazio. Resolvido com `.env` na raiz do projeto + Reload Window.
-- **Pendências para fechar o trabalho** (itens 12–20 da §30 acima):
-  - Imprimir `study.best_params` e `study.trials_dataframe()`.
-  - Construir e treinar **modelo vencedor** no dataset cheio.
-  - Avaliar no teste + matriz de confusão.
-  - Visualizações Optuna (`plot_optimization_history`, `plot_param_importances`).
-  - Re-treinar baseline na amostra de tuning para comparação justa (§29).
-  - Tabela final + arquitetura clássica (item 6 da Lauda).
-- **Decisão pendente**: se o vencedor no teste continuar em ~0.50, voltar para opção A (sem BN nas duas arquiteturas) e refazer Optuna — o baseline sem BN tinha 76% test, então tem teto bem maior.
+- **Run All com a arquitetura sem BN concluída**: baseline (sem BN, lr=0.001) chegou a `test_acc=0.7473`, similar à versão original. Optuna sem BN encontrou `best_value=0.6951` (trial 12) com lr=0.000388, dropout=0.1, dense=192.
+- **Bug identificado no treino do vencedor**: a cell 42 do notebook treinava por 20 épocas **sem `EarlyStopping`**, então o modelo passava do pico medido pelo Optuna e degradava (cf. §30b). Sintoma: vencedor com train_acc 0.91 / val_acc 0.34 / test_acc 0.3517 — bem abaixo do `best_value` 0.6951.
+- **Diagnóstico confirmou que o pipeline polars está correto**: o baseline avaliado em `df_validation` polars deu 0.94 (alto devido a sobreposição com seu próprio treino, mas confirma que labels e imagens batem).
+- **Rodada com early stopping no vencedor**: test_acc subiu de 0.3517 → 0.4540. Confirmou §30b mas ainda bem abaixo do baseline (0.7740).
+- **Amplificação do tuning (opção C)**: amostra 5000/1000, 30 trials. Optuna chegou a `best_value=0.7332` (trial 12), o melhor até então. Mas trial 16+ quebrou com OOM, e o `evaluate` final do vencedor também travou com OOM — sintoma da Dense gigante (10.6M params) saturando VRAM.
+- **Diagnóstico arquitetural (§30c)**: identificada a Dense `82944 → 128` como causa raiz tanto do overfitting quanto do OOM. Aplicada mudança 1: `Flatten` → `GlobalAveragePooling2D` nas três funções.
+- **Rodada com GAP isolado**: baseline manteve test_acc 0.7393 (sem OOM, sem overfit), mas Optuna travou em `best_value=0.413` e vencedor colapsou pra val_acc 0.179 (random). Confirmou §30c contras item 3.
+- **Aplicada mudança 2**: 3º e 4º blocos Conv com 128 e 256 filtros (fixos), pyramid 32→64→128→256. Documentado na §30d.
+- **Aplicadas mudanças 4 e 5**: data augmentation (3 layers) + `padding="same"` em todas as Conv. Documentado nas §30e e §30f.
+- **Resultado após mudanças 4 e 5**:
+  - Baseline test_acc: **0.8227** (vs 0.7393 — ganho de ~9 pontos, augmentation funcionou).
+  - Optuna best_value: 0.3591 (caiu de 0.41 — augmentation tornou trials menos sortudos na amostra pequena).
+  - Vencedor test_acc: 0.3050 (continua colapsando).
+- **Diagnóstico**: arquitetura está sólida (baseline em 0.82); o problema agora é o **espaço de busca do Optuna**. Otimizador continua escolhendo configurações que ganham na amostra de 5000 mas falham no full data.
+- **Refactor para módulo `src/`**: funções foram movidas para `src/data.py`, `src/models.py`, `src/plotting.py`, `src/tuning.py`. O notebook agora só orquestra (sem `def`s no corpo). Garante `_build_cnn` único — baseline, Optuna e vencedor compartilham construtor por design, eliminando risco de drift entre arquiteturas (cf. §26).
+- **Aplicadas restrições do search space (Categoria A)**, documentadas na §30g:
+  - `dropout_rate`: `[0.1, 0.5]` → `[0.2, 0.5]`.
+  - `learning_rate`: `[1e-4, 1e-2]` → `[3e-4, 5e-3]`.
+  - `epochs` por trial: `10 → 15`. `patience`: `3 → 5`.
+- **Resultado da Categoria A**: baseline test_acc 0.8267 (estável), Optuna `best_value` 0.3541 (sem ganho real), vencedor test_acc 0.3117 (continua colapsando — val_acc travada em ~0.33 desde a primeira época).
+- **Diagnóstico**: a métrica `max(val_accuracy)` no objective é volátil em amostras pequenas — TPE pode estar premiando trials sortudos com pico de acurácia em uma época específica. A val_loss é mais suave e refletiria melhor a qualidade real da configuração.
+- **Aplicada Categoria B**: objetivo mudou para `min(val_loss)` com `direction="minimize"` + adicionado `MedianPruner`. Documentado na §30h.
+- **Resultado da Categoria B**: vencedor test_acc 0.3020 — colapso persistente. Categoria B não resolveu o problema do vencedor.
+- **Diagnóstico controlado** (re-treinar baseline na pipeline polars): baseline normal em 0.82 caiu para 0.31 → bug confirmado no pipeline polars.
+- **Aplicado o fix (§30i)**: `df_labeled.sample(fraction=1.0, shuffle=True, seed=seed)` antes do `from_tensor_slices`.
+- **Resultado final** (com fix):
+  - Baseline test_acc: **0.8087** (inalterado, baseline sempre usou `image_dataset_from_directory`).
+  - Optuna `best_value` (val_loss): **0.6206** (era 1.7+ antes — agora é loss de modelos que aprenderam de verdade).
+  - **Vencedor test_acc: 0.8107** (ligeiramente acima do baseline — o Optuna conseguiu melhorar marginalmente).
+  - Diagnóstico controlado pós-fix: baseline na pipeline polars em 5 épocas alcança 0.7437 test_acc.
+  - Sanity check da cell 27: labels `[2 4 0 0 1]` (mistura aleatória — era `[5 5 5 5 5]` antes).
+  - Pruner ativo: 14 de 20 trials podadas pelo `MedianPruner`, orçamento focado em 6 trials completas.
+
+### Quadro do colapso do vencedor (consistente desde a primeira rodada com GAP)
+
+| Configuração | Baseline test | Optuna best (na amostra) | Vencedor test |
+| --- | --- | --- | --- |
+| Original (Flatten, sem BN) | 0.7650 | 0.5092 | 0.3667 |
+| Flatten + BN | 0.5153 | 0.6951 | OOM |
+| GAP só (2 Conv) | 0.7393 | 0.4132 | 0.1750 |
+| GAP + 4 Conv | 0.74 | 0.41 | 0.3243 |
+| + aug + `padding="same"` | 0.8227 | 0.3591 | 0.3050 |
+| + Categoria A (search space) | 0.8267 | 0.3541 | 0.3117 |
+| + Categoria B (min val_loss + pruner) | a medir | a medir | 0.3020 |
+
+O padrão é claro: **baseline melhora com cada mudança arquitetural, vencedor estaciona em ~0.30**. Não é um problema do search space, do regime de parada, ou do pruner — é estrutural.
+
+### Hipótese ativa
+
+O baseline e o vencedor treinam com pipelines de dados **diferentes**:
+
+- **Baseline**: `image_dataset_from_directory(DATA_DIR_TRAIN, validation_split=0.2)` — split interno do TF.
+- **Vencedor**: `create_dataset_for_tf` em cima do split estratificado em polars.
+
+Ambos deveriam ser funcionalmente equivalentes (mesmas imagens-fonte), mas o vencedor **nunca atinge val_acc decente desde a primeira época** — train sobe (0.71+), val grudou em 0.33 do início ao fim. Isso aponta para alguma diferença entre os dois pipelines que só se manifesta em conjunção com a arquitetura atual (aug + GAP).
+
+### Próximo passo crítico: diagnóstico decisivo do pipeline
+
+Antes de continuar adicionando complexidade, validar se o pipeline polars está OK **com a arquitetura atual**:
+
+1. **Re-treinar o baseline na `df_train` polars** (mesma arquitetura, mesma config, mas dados polars em vez de `image_dataset_from_directory`). Se baseline cair pra 0.30 também, é o pipeline polars; se mantiver ~0.82, é específico do vencedor/Optuna.
+2. **Avaliar o baseline em `df_validation` polars** (sanity check direto).
+
+Sem esse diagnóstico, continuar mexendo no Optuna é tiro no escuro.
+
+### Pendências para fechar o trabalho
+
+- Diagnóstico do pipeline polars (passo acima).
+- Matriz de confusão e `classification_report` por classe.
+- Visualizações Optuna (`plot_optimization_history`, `plot_param_importances`).
+- Re-treinar baseline na amostra de tuning para comparação justa (§29).
+- Tabela final + arquitetura clássica (item 6 da Lauda).

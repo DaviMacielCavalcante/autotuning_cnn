@@ -875,6 +875,70 @@ if shuffle:
 
 O experimento que resolveu (treinar baseline no pipeline suspeito) é o padrão "**isolar a variável**" da metodologia científica básica. Custou 1 minuto de execução e eliminou 6 hipóteses erradas em uma única medição.
 
+## 31. Comparação justa: o baseline supera o vencedor do Optuna
+
+**Descoberta da rodada atual, e provavelmente o resultado mais importante do trabalho.** Quando baseline e vencedor são treinados em condições idênticas, o **baseline ganha**: 0.8357 vs 0.8107 no teste. A "vitória" anterior (0.8107 vs 0.8087) era um artefato de comparação.
+
+### O artefato: o titular antigo comparava maçã com laranja
+
+O baseline original (cell 9–10, test_acc 0.8087) e o vencedor (cell 34, test_acc 0.8107) diferiam em **três fatores além dos hiperparâmetros**:
+
+| Fator | Baseline original | Vencedor |
+| --- | --- | --- |
+| Pipeline de dados | `image_dataset_from_directory` (keras) | polars → tf.data |
+| Batch size | 64 | 32 |
+| Early stopping | não (20 épocas cheias) | sim (`patience=3`) |
+| Test acc | 0.8087 | 0.8107 |
+
+Com três variáveis confundidas, a diferença de 0.002 não dizia nada sobre o tuning. Poderia ser pipeline, batch ou protocolo de parada — não dava pra atribuir ao Optuna.
+
+### A correção (§29 aplicado)
+
+Re-treinar o baseline na **mesma arquitetura `build_baseline`**, no **mesmo pipeline polars**, com o **mesmo `EPOCHS` + mesmo `EarlyStopping(patience=3, restore_best_weights=True)`** do vencedor. Único fator que sobra variando entre os dois modelos: os hiperparâmetros escolhidos pelo Optuna.
+
+Resultado: baseline justo **0.8357** (parou no epoch 15, melhor no 12 com val_loss 0.4482) vs vencedor **0.8107**.
+
+### Por que o tuning não ajudou (a intuição central)
+
+O Optuna foi rodado numa **amostra reduzida** (5000 treino / 1000 validação, decisão de velocidade). Ele otimizou `val_loss` *nesse regime pequeno*. O que escolheu:
+
+| Hiperparâmetro | Baseline | Vencedor Optuna |
+| --- | --- | --- |
+| `dense_units` | 128 | **64** |
+| filtros 1 / 2 | 32 / 64 | 48 / 128 |
+| `dropout_rate` | 0.3 | 0.3 |
+| `learning_rate` | 0.001 (default) | 0.0024 |
+
+O vencedor tem um **classificador menor** (dense 64 vs 128). Faz sentido no regime de tuning: com 5k imagens, modelo menor generaliza melhor (menos overfit). Mas treinado no dataset cheio (11k), há dado suficiente pra alimentar o classificador maior — e o baseline de dense 128 leva vantagem.
+
+**Lição:** os hiperparâmetros ótimos dependem do tamanho dos dados. Tunar numa subamostra encontra o modelo ótimo *para a subamostra*, que não necessariamente transfere pro regime de dados completo. Há um trade-off explícito entre custo do tuning (subamostra = rápido) e validade do resultado (subamostra = regime diferente do final).
+
+### Caveat de variância — confirmado por N=3 (e reframe a conclusão)
+
+A comparação de 1 treino acima (baseline 0.8357 vs vencedor 0.8107) era frágil: 1 run de cada, sujeito a ruído de init/augmentation/shuffle. Rodamos então o experimento de variância — baseline e vencedor **3 treinos cada**, semente explícita por rodada (`SEED + i`), design pareado (mesma semente pro par na mesma rodada), tudo o mais idêntico.
+
+| | run 1 | run 2 | run 3 | média ± dp |
+| --- | --- | --- | --- | --- |
+| baseline | 0.8423 | 0.7830 | 0.8490 | **0.8248 ± 0.0363** |
+| vencedor | 0.8280 | 0.8380 | 0.8400 | **0.8353 ± 0.0064** |
+
+Gap médio (baseline − vencedor): **−0.0106** (vencedor ligeiramente à frente na média).
+
+**Duas conclusões, ambas diferentes do que o §31-de-1-run sugeria:**
+
+1. **Médias indistinguíveis.** O gap (−0.0106) é 3–4× menor que o desvio do baseline (0.0363). Em acurácia média os dois empatam em ~0.83 — nenhum "vence" o outro de forma confiável. Teste pareado informal (N=3): t ≈ −0.5, longe de significância.
+2. **O modelo tunado é ~6× mais estável** (dp 0.0064 vs 0.0363). O baseline despencou pra 0.783 numa rodada (azar de init); o vencedor ficou colado em 0.83–0.84 nas três.
+
+**A comparação de 1 run era enganosa nas duas pontas:** pegou um baseline sortudo (0.8357) *e* um vencedor azarado (0.8107). Daí a importância de medir variância antes de concluir — comparar modelos estocásticos com 1 treino cada é não-confiável. (Ponto metodológico forte pra análise crítica.)
+
+### Conclusão revisada: o ganho do tuning foi robustez, não pico
+
+O autotuning **não aumentou a acurácia de pico** (médias empatadas), mas entregou um modelo **substancialmente mais robusto à inicialização aleatória** — menor risco de um treino ruim. Benefício real e defensável: em produção, quer-se o modelo que entrega 0.83 *consistentemente*, não um que às vezes dá 0.85 e às vezes 0.78. Hipótese pro mecanismo (não comprovada): a combinação `lr=0.0024` + `dense=64` converge pra uma bacia mais consistente. O que está medido é a menor variância.
+
+### Por que isso não invalida o trabalho
+
+A Lauda pede o **processo de autotuning bem executado + análise crítica** — não exige que o tuning vença em acurácia. A história final é até favorável ao tuning (robustez) e rica metodologicamente (a armadilha do 1-run). Mais defensável numa banca que uma melhoria fabricada por comparação injusta.
+
 ## 30b. Treino do vencedor precisa replicar o regime de parada do `objective`
 
 O `study.best_value` que o Optuna reporta é o **pico de `val_accuracy`** atingido durante o `model.fit` do trial, **com os pesos do pico restaurados** (porque o `objective` usa `EarlyStopping(restore_best_weights=True)` e retorna `max(history.history["val_accuracy"])`).
@@ -995,6 +1059,11 @@ Confirmar que **todas as células executam em ordem do zero** antes de entregar 
   - Diagnóstico controlado pós-fix: baseline na pipeline polars em 5 épocas alcança 0.7437 test_acc.
   - Sanity check da cell 27: labels `[2 4 0 0 1]` (mistura aleatória — era `[5 5 5 5 5]` antes).
   - Pruner ativo: 14 de 20 trials podadas pelo `MedianPruner`, orçamento focado em 6 trials completas.
+- **Análise final iniciada** (itens 5/6 da Lauda): matriz de confusão e `classification_report` por classe do vencedor gerados (via sklearn, `ConfusionMatrixDisplay` em cima do matplotlib — sem seaborn).
+- **Comparação justa executada (§31 / item #10 da Lauda)**: a cell 37 (antes diagnóstico de 5 épocas) foi repurposada — baseline na mesma arquitetura, mesmo pipeline polars, mesmo `EPOCHS` + mesmo early stopping do vencedor. Resultado: **baseline justo 0.8357** (parou no epoch 15, melhor no 12) vs **vencedor 0.8107**. O baseline supera o vencedor numa comparação maçã-com-maçã. O titular antigo (0.8107 vs 0.8087) era artefato de pipeline/batch/protocolo diferentes. Causa provável: tuning na subamostra (5k/1k) escolheu classificador menor (dense 64) que não transfere pro dataset cheio (11k). Detalhe na §31.
+- **Encaminhamento escolhido: confirmar variância (opção c).** Experimento N=3 baseline e vencedor (semente por rodada, design pareado). Resultado: **baseline 0.8248 ± 0.0363** vs **vencedor 0.8353 ± 0.0064**. Médias indistinguíveis (gap −0.0106 « dp do baseline), mas **vencedor ~6× mais estável**. A comparação de 1 run (§31) era enganosa nas duas pontas. **Conclusão revisada:** o tuning não ganhou em pico, mas entregou robustez à inicialização. Detalhe na §31.
+- **Análise dos trials fechada (itens 7/8/9 da Lauda):** visualizações Optuna (`plot_optimization_history`, `plot_param_importances`) via plotly, exportadas como PNG em `figures/` (engine `kaleido`; `nbformat` pro render inline). Tabela comparativa final montada em polars com média ± dp + `best_value`. Dependências adicionadas pelo usuário: `scikit-learn`, `plotly`, `kaleido`, `nbformat`.
+- **Pendências restantes:** item 6 (arquitetura clássica com transfer learning), item 11 (análise crítica redigida), slides + declaração de uso de IA.
 
 ### Quadro do colapso do vencedor (consistente desde a primeira rodada com GAP)
 
@@ -1012,6 +1081,8 @@ O padrão é claro: **baseline melhora com cada mudança arquitetural, vencedor 
 
 ### Hipótese ativa
 
+> **RESOLVIDA (cf. §30i).** A hipótese abaixo estava certa: a diferença entre os pipelines era o problema, especificamente o shuffle insuficiente no pipeline polars (catastrophic forgetting). Mantida como registro histórico do raciocínio que levou ao diagnóstico.
+
 O baseline e o vencedor treinam com pipelines de dados **diferentes**:
 
 - **Baseline**: `image_dataset_from_directory(DATA_DIR_TRAIN, validation_split=0.2)` — split interno do TF.
@@ -1020,6 +1091,8 @@ O baseline e o vencedor treinam com pipelines de dados **diferentes**:
 Ambos deveriam ser funcionalmente equivalentes (mesmas imagens-fonte), mas o vencedor **nunca atinge val_acc decente desde a primeira época** — train sobe (0.71+), val grudou em 0.33 do início ao fim. Isso aponta para alguma diferença entre os dois pipelines que só se manifesta em conjunção com a arquitetura atual (aug + GAP).
 
 ### Próximo passo crítico: diagnóstico decisivo do pipeline
+
+> **CONCLUÍDO.** O diagnóstico abaixo foi executado, confirmou o bug do shuffle (§30i) e levou ao fix. Registro histórico.
 
 Antes de continuar adicionando complexidade, validar se o pipeline polars está OK **com a arquitetura atual**:
 
@@ -1030,8 +1103,12 @@ Sem esse diagnóstico, continuar mexendo no Optuna é tiro no escuro.
 
 ### Pendências para fechar o trabalho
 
-- Diagnóstico do pipeline polars (passo acima).
-- Matriz de confusão e `classification_report` por classe.
-- Visualizações Optuna (`plot_optimization_history`, `plot_param_importances`).
-- Re-treinar baseline na amostra de tuning para comparação justa (§29).
-- Tabela final + arquitetura clássica (item 6 da Lauda).
+- ~~Diagnóstico do pipeline polars~~ ✅ (§30i, bug do shuffle corrigido).
+- ~~Matriz de confusão e `classification_report` por classe~~ ✅ (itens 5/6 da Lauda).
+- ~~Re-treinar baseline para comparação justa~~ ✅ (§31 — baseline 0.8357 > vencedor 0.8107).
+- **Decisão de encaminhamento** (usuário): reportar honestamente / re-rodar Optuna no full data / confirmar variância.
+- Visualizações Optuna (`plot_optimization_history`, `plot_param_importances`) — itens 7/8.
+- Tabela comparativa final (item #9): baseline justo / Optuna best_value / vencedor.
+- Análise crítica (item #11): classes mais confundidas + lição do regime de dados (§31).
+- Arquitetura clássica com transfer learning (item 6 da Lauda).
+- Declaração de uso de IA + slides (item 4 da Lauda).

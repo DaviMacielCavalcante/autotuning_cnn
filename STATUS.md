@@ -1,6 +1,6 @@
 # Status do projeto — autotuning_cnn
 
-**Última atualização:** 2026-06-05 (pipeline funcional, primeira rodada do vencedor acima do baseline)
+**Última atualização:** 2026-06-06 (análise dos trials fechada: viz 7/8 + tabela final 9; PNGs em `figures/`)
 **Dataset:** Intel Image Classification — 6 classes (`buildings`, `forest`, `glacier`, `mountain`, `sea`, `street`)
 **Split:** 11230 treino / 2804 validação / 3000 teste
 
@@ -85,9 +85,25 @@ Notebook agora só orquestra — não tem `def`s no corpo. Isso garante que base
 | + aug + `padding="same"` | 0.8227 | 0.3591 val_acc | 0.3050 |
 | + Categoria A (search space) | 0.8267 | 0.3541 val_acc | 0.3117 |
 | + Categoria B (`min(val_loss)` + pruner) | 0.8270 | 1.7008 val_loss | 0.3020 |
-| **+ Fix do shuffle (§30i) — rodada atual** | **0.8087** | **0.6206 val_loss** | **0.8107** |
+| + Fix do shuffle (§30i) | 0.8087¹ | 0.6206 val_loss | 0.8107 |
+| **+ Comparação justa (§31) — rodada atual** | **0.8357²** | **0.6206 val_loss** | **0.8107** |
 
-O baseline subiu progressivamente conforme as mudanças arquiteturais (0.76 → 0.82). O vencedor estacionou em ~0.30 em todas as rodadas porque o bug do pipeline (catastrophic forgetting) anulava qualquer melhoria. Com o fix aplicado, **o vencedor passou do baseline pela primeira vez** (0.8107 vs 0.8087).
+¹ Baseline no pipeline keras (`image_dataset_from_directory`), batch 64, 20 épocas sem early stopping — **não comparável** ao vencedor.
+² Baseline no **mesmo pipeline polars** do vencedor, batch 32, mesmo `EPOCHS` + mesmo early stopping. Comparação maçã-com-maçã (§29).
+
+O baseline subiu progressivamente conforme as mudanças arquiteturais (0.76 → 0.82). O vencedor estacionou em ~0.30 em todas as rodadas porque o bug do pipeline (catastrophic forgetting) anulava qualquer melhoria. Com o fix do shuffle aplicado, ambos passaram a aprender de verdade.
+
+**Conclusão consolidada (§31, confirmada por variância N=3):**
+
+| Modelo | test_acc (3 runs) | média ± dp |
+| --- | --- | --- |
+| Baseline (justo) | 0.8423 / 0.7830 / 0.8490 | **0.8248 ± 0.0363** |
+| Vencedor Optuna | 0.8280 / 0.8380 / 0.8400 | **0.8353 ± 0.0064** |
+
+- **Médias estatisticamente indistinguíveis** (gap −0.0106, bem menor que o dp do baseline). O autotuning **não aumentou a acurácia de pico**.
+- **O modelo tunado é ~6× mais estável** (dp 0.0064 vs 0.0363). O baseline despencou pra 0.783 numa rodada; o vencedor ficou colado em 0.83–0.84.
+- **Lição metodológica:** a comparação de 1 run (que sugeria baseline 0.8357 vs vencedor 0.8107) era enganosa nas duas pontas — pegou um baseline sortudo e um vencedor azarado. Comparar modelos estocásticos com 1 treino cada é não-confiável.
+- **Conclusão pra análise crítica:** o ganho do tuning foi **robustez à inicialização**, não pico de acurácia. Resultado honesto e favorável ao processo.
 
 Notas sobre a rodada atual:
 
@@ -98,13 +114,10 @@ Notas sobre a rodada atual:
 
 ### Próximo passo
 
-Pipeline está finalmente funcional. Agora dá pra focar em fechar o trabalho:
+Análise dos trials fechada: visualizações (7/8) e tabela final (9) prontas, PNGs exportados em `figures/`. Faltam pra fechar o trabalho:
 
-- Matriz de confusão + `classification_report` do vencedor (item 5 da Lauda).
-- Visualizações Optuna (`plot_optimization_history`, `plot_param_importances`).
-- Re-treinar baseline na amostra de tuning para comparação justa (§29).
-- Tabela final comparativa.
-- Item 6 da Lauda (arquitetura clássica).
+- **Item 6 — arquitetura clássica com transfer learning** (VGG/ResNet/EfficientNet). Sugestão: ResNet50 ou EfficientNetB0 em feature extraction (extrator congelado + cabeça nova). Atenção ao `preprocess_input` específico da família (não usar `Rescaling(1/255)`).
+- **Item 11 — análise crítica redigida** — insumo forte (robustez §31 + matriz de confusão + importância de hiperparâmetros).
 - Slides + declaração de uso de IA generativa.
 
 ---
@@ -146,13 +159,13 @@ Pruner mais sofisticado que aloca orçamento em "rounds" — mais agressivo cort
 | 2 | Melhor configuração (`study.best_params`) | ✅ existe no notebook |
 | 3 | Curvas de treino/validação do baseline e do vencedor | ✅ via `plotar_curvas` |
 | 4 | Avaliação final no conjunto de teste (`evaluate`) | ✅ existe no notebook |
-| 5 | **Matriz de confusão** | ❌ a fazer |
-| 6 | **`classification_report` por classe** | ❌ a fazer |
-| 7 | **`optuna.visualization.plot_optimization_history(study)`** | ❌ a fazer |
-| 8 | **`optuna.visualization.plot_param_importances(study)`** | ❌ a fazer |
-| 9 | **Tabela comparativa final** (baseline / Optuna best / vencedor) | ❌ a fazer |
-| 10 | **Re-treinar baseline na amostra de tuning** para comparação justa (cf. §29) | ❌ a fazer |
-| 11 | **Análise crítica** (overfitting, classes mais confundidas, limitações) | ❌ a fazer |
+| 5 | **Matriz de confusão** | ✅ feito (sklearn `ConfusionMatrixDisplay`) |
+| 6 | **`classification_report` por classe** | ✅ feito (sklearn) |
+| 7 | **`optuna.visualization.plot_optimization_history(study)`** | ✅ feito (plotly + export PNG em `figures/`) |
+| 8 | **`optuna.visualization.plot_param_importances(study)`** | ✅ feito (plotly + export PNG em `figures/`) |
+| 9 | **Tabela comparativa final** (baseline / Optuna best / vencedor) | ✅ feito (polars, com média ± dp + best_value) |
+| 10 | **Re-treinar baseline para comparação justa** (cf. §29/§31) | ✅ feito + variância N=3 |
+| 11 | **Análise crítica** (overfitting, classes mais confundidas, limitações) | ⚠️ insumo forte (§31 robustez + matriz), falta redigir |
 | 12 | **Item 6 da Lauda — arquitetura clássica** (VGG/ResNet/EfficientNet com transfer learning) | ❌ a fazer |
 
 ### Item 4 da Lauda — entrega
@@ -170,7 +183,9 @@ Pruner mais sofisticado que aloca orçamento em "rounds" — mais agressivo cort
 - O markdown da cell 26 ("testando") pode virar algo mais descritivo tipo "Sanity check do pipeline tf.data".
 - A cell 0 importa `pandas` apenas porque `study.trials_dataframe()` retorna `pd.DataFrame`. Justificável.
 - O `.env` na raiz precisa estar no `.gitignore` antes de qualquer commit (paths absolutos do venv local).
-- A cell 37 (diagnóstico de re-treino do baseline no pipeline polars) pode ser removida após o fix funcionar — ou mantida como evidência do diagnóstico, comentada.
+- A cell 37 foi **repurposada** de diagnóstico para a comparação justa (§31) — não é mais para remover; é a fonte do baseline justo.
+- **Novas dependências adicionadas** nesta fase de análise: `scikit-learn` (matriz de confusão + `classification_report`), `plotly` + `kaleido` (visualizações Optuna + export PNG) e `nbformat` (render inline do plotly no Jupyter).
+- **Nova pasta `figures/`** com os PNGs exportados (histórico de otimização, importância de hiperparâmetros). Conferir se está no `.gitignore` ou se deve ser versionada.
 
 ---
 
@@ -178,5 +193,5 @@ Pruner mais sofisticado que aloca orçamento em "rounds" — mais agressivo cort
 
 - `Lauda CNN 2026.pdf` — especificação oficial do trabalho.
 - `CNN_com_flowers.ipynb` — notebook da professora (estrutura de referência).
-- `APRENDIZADO.md` — registro detalhado de cada decisão metodológica e lição aprendida (28 seções, incluindo §30c–§30i sobre as últimas iterações).
+- `APRENDIZADO.md` — registro detalhado de cada decisão metodológica e lição aprendida (inclui §30c–§30i sobre o diagnóstico do pipeline e §31 sobre a comparação justa + variância).
 - `src/` — código modularizado (data, models, plotting, tuning).

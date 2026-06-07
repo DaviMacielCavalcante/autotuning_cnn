@@ -939,6 +939,31 @@ O autotuning **não aumentou a acurácia de pico** (médias empatadas), mas entr
 
 A Lauda pede o **processo de autotuning bem executado + análise crítica** — não exige que o tuning vença em acurácia. A história final é até favorável ao tuning (robustez) e rica metodologicamente (a armadilha do 1-run). Mais defensável numa banca que uma melhoria fabricada por comparação injusta.
 
+## 32. Transfer learning (item 6): EfficientNetB0 domina a CNN do zero
+
+**Resultado do item 6 da Lauda.** Aplicar uma arquitetura clássica pré-treinada (EfficientNetB0, weights ImageNet) em feature extraction, no mesmo dataset e mesmo protocolo. Resultado no teste: **0.9143**, contra ~0.83 do baseline e do vencedor — salto de ~8–9 pontos.
+
+### A pegadinha nº 1: pré-processamento específico da família
+
+Cada rede de `keras.applications` espera uma normalização própria. **A EfficientNet normaliza internamente** (tem `Rescaling`/`Normalization` como primeiras camadas) e espera pixels crus em **[0, 255]** — seu `preprocess_input` é um no-op. Logo: **não** aplicar `Rescaling(1/255)` antes dela. Aplicar o rescaling errado faz o modelo "ver" valores ~255× menores e a acurácia desaba pra ~0.17 (aleatório em 6 classes). Como o pipeline polars já entrega [0, 255], bastou alimentar direto.
+
+### A pegadinha nº 2: BatchNorm em base congelada
+
+Ao chamar `base(x, training=False)` no Functional API, as BatchNorm do extrator ficam em modo inferência (usam as estatísticas da ImageNet, não recalculam nas imagens novas). Sem isso, as BN se "desajustariam" durante o treino da cabeça. Por isso o Functional foi necessário (o Sequential não deixa passar `training=False` à sub-rede).
+
+### Evidências de que deu certo
+
+- **Congelamento:** `summary()` mostrou 164.742 trainable (só a cabeça) vs 4.049.571 non-trainable (extrator). 4% dos params treinando.
+- **O "pulo" do transfer:** val_accuracy **0.9101 já na época 1** (a CNN do zero levava ~10 épocas pra chegar a 0.80). O extrator chega sabendo ver bordas/texturas/formas.
+- **Generalização:** test_acc 0.9143 ≈ val_acc ~0.94 → gap treino/teste pequeno, sem overfit.
+- Melhor época 8 (val_loss 0.1832), early stopping na 11, `restore_best_weights`.
+
+### A lição
+
+A diferença entre os modelos do zero (~0.83) e o transfer learning (~0.91) é maior que qualquer ganho que o autotuning produziu na CNN pequena. **Na prática, reaproveitar um extrator pré-treinado em 1.2M de imagens vale mais que afinar hiperparâmetros de uma rede treinada do zero.** É a lição central da visão computacional moderna — e, no contexto do trabalho, contextualiza o autotuning: ele é a ferramenta certa quando você *precisa* treinar do zero, mas transfer learning é o primeiro recurso quando há um modelo pré-treinado adequado.
+
+Fase 2 (fine-tuning, descongelar topo do extrator) foi **descartada** — não exigida pela Lauda e o resultado de feature extraction já é decisivo.
+
 ## 30b. Treino do vencedor precisa replicar o regime de parada do `objective`
 
 O `study.best_value` que o Optuna reporta é o **pico de `val_accuracy`** atingido durante o `model.fit` do trial, **com os pesos do pico restaurados** (porque o `objective` usa `EarlyStopping(restore_best_weights=True)` e retorna `max(history.history["val_accuracy"])`).
@@ -1063,7 +1088,8 @@ Confirmar que **todas as células executam em ordem do zero** antes de entregar 
 - **Comparação justa executada (§31 / item #10 da Lauda)**: a cell 37 (antes diagnóstico de 5 épocas) foi repurposada — baseline na mesma arquitetura, mesmo pipeline polars, mesmo `EPOCHS` + mesmo early stopping do vencedor. Resultado: **baseline justo 0.8357** (parou no epoch 15, melhor no 12) vs **vencedor 0.8107**. O baseline supera o vencedor numa comparação maçã-com-maçã. O titular antigo (0.8107 vs 0.8087) era artefato de pipeline/batch/protocolo diferentes. Causa provável: tuning na subamostra (5k/1k) escolheu classificador menor (dense 64) que não transfere pro dataset cheio (11k). Detalhe na §31.
 - **Encaminhamento escolhido: confirmar variância (opção c).** Experimento N=3 baseline e vencedor (semente por rodada, design pareado). Resultado: **baseline 0.8248 ± 0.0363** vs **vencedor 0.8353 ± 0.0064**. Médias indistinguíveis (gap −0.0106 « dp do baseline), mas **vencedor ~6× mais estável**. A comparação de 1 run (§31) era enganosa nas duas pontas. **Conclusão revisada:** o tuning não ganhou em pico, mas entregou robustez à inicialização. Detalhe na §31.
 - **Análise dos trials fechada (itens 7/8/9 da Lauda):** visualizações Optuna (`plot_optimization_history`, `plot_param_importances`) via plotly, exportadas como PNG em `figures/` (engine `kaleido`; `nbformat` pro render inline). Tabela comparativa final montada em polars com média ± dp + `best_value`. Dependências adicionadas pelo usuário: `scikit-learn`, `plotly`, `kaleido`, `nbformat`.
-- **Pendências restantes:** item 6 (arquitetura clássica com transfer learning), item 11 (análise crítica redigida), slides + declaração de uso de IA.
+- **Item 6 fechado — transfer learning (§32):** EfficientNetB0 (ImageNet, feature extraction) no mesmo pipeline/protocolo. **test_acc 0.9143** vs ~0.83 do baseline/vencedor — salto de ~8–9 pontos, inequívoco. Congelamento confirmado (164k trainable vs 4M frozen), val_acc 0.91 já na época 1, sem overfit. Pré-processamento correto (EfficientNet normaliza internamente, sem `Rescaling`). **Fase 2 (fine-tuning) descartada** — não exigida e resultado já decisivo.
+- **Pendências restantes:** item 11 (análise crítica redigida), slides + declaração de uso de IA generativa, limpeza final do notebook.
 
 ### Quadro do colapso do vencedor (consistente desde a primeira rodada com GAP)
 

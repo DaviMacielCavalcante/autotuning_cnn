@@ -1,6 +1,6 @@
 # Status do projeto — autotuning_cnn
 
-**Última atualização:** 2026-06-06 (análise dos trials fechada: viz 7/8 + tabela final 9; PNGs em `figures/`)
+**Última atualização:** 2026-06-07 (item 6 fechado: EfficientNetB0 transfer learning, test_acc 0.9143 — §32)
 **Dataset:** Intel Image Classification — 6 classes (`buildings`, `forest`, `glacier`, `mountain`, `sea`, `street`)
 **Split:** 11230 treino / 2804 validação / 3000 teste
 
@@ -95,15 +95,17 @@ O baseline subiu progressivamente conforme as mudanças arquiteturais (0.76 → 
 
 **Conclusão consolidada (§31, confirmada por variância N=3):**
 
-| Modelo | test_acc (3 runs) | média ± dp |
+| Modelo | test_acc | obs |
 | --- | --- | --- |
-| Baseline (justo) | 0.8423 / 0.7830 / 0.8490 | **0.8248 ± 0.0363** |
-| Vencedor Optuna | 0.8280 / 0.8380 / 0.8400 | **0.8353 ± 0.0064** |
+| Baseline (do zero, justo) | **0.8248 ± 0.0363** | 3 runs (0.8423 / 0.7830 / 0.8490) |
+| Vencedor Optuna | **0.8353 ± 0.0064** | 3 runs (0.8280 / 0.8380 / 0.8400) — ~6× mais estável |
+| EfficientNetB0 (transfer, §32) | **0.9143** | 1 run — salto de ~8–9 pontos |
 
-- **Médias estatisticamente indistinguíveis** (gap −0.0106, bem menor que o dp do baseline). O autotuning **não aumentou a acurácia de pico**.
-- **O modelo tunado é ~6× mais estável** (dp 0.0064 vs 0.0363). O baseline despencou pra 0.783 numa rodada; o vencedor ficou colado em 0.83–0.84.
-- **Lição metodológica:** a comparação de 1 run (que sugeria baseline 0.8357 vs vencedor 0.8107) era enganosa nas duas pontas — pegou um baseline sortudo e um vencedor azarado. Comparar modelos estocásticos com 1 treino cada é não-confiável.
-- **Conclusão pra análise crítica:** o ganho do tuning foi **robustez à inicialização**, não pico de acurácia. Resultado honesto e favorável ao processo.
+A narrativa final em três níveis:
+
+1. **Baseline x Vencedor (CNN do zero):** médias estatisticamente indistinguíveis (gap −0.0106, menor que o dp do baseline). O autotuning **não aumentou a acurácia de pico**, mas deixou o modelo **~6× mais estável** (dp 0.0064 vs 0.0363; o baseline chegou a despencar pra 0.783). O ganho do tuning foi **robustez à inicialização**.
+2. **Lição metodológica:** a comparação de 1 run (que sugeria baseline 0.8357 vs vencedor 0.8107) era enganosa nas duas pontas — pegou um baseline sortudo e um vencedor azarado. Comparar modelos estocásticos com 1 treino cada é não-confiável.
+3. **Transfer learning domina (§32):** EfficientNetB0 atingiu **0.9143** no teste — ~8–9 pontos acima dos modelos do zero, gap muito maior que a variância deles. **Reaproveitar um extrator pré-treinado vale mais que afinar hiperparâmetros de uma rede pequena.** Lição central de visão computacional moderna.
 
 Notas sobre a rodada atual:
 
@@ -114,11 +116,12 @@ Notas sobre a rodada atual:
 
 ### Próximo passo
 
-Análise dos trials fechada: visualizações (7/8) e tabela final (9) prontas, PNGs exportados em `figures/`. Faltam pra fechar o trabalho:
+Toda a parte técnica está fechada (itens 1–9 + item 6 ✅). Fase 2 (fine-tuning) descartada. Sobram redação e entrega:
 
-- **Item 6 — arquitetura clássica com transfer learning** (VGG/ResNet/EfficientNet). Sugestão: ResNet50 ou EfficientNetB0 em feature extraction (extrator congelado + cabeça nova). Atenção ao `preprocess_input` específico da família (não usar `Rescaling(1/255)`).
-- **Item 11 — análise crítica redigida** — insumo forte (robustez §31 + matriz de confusão + importância de hiperparâmetros).
-- Slides + declaração de uso de IA generativa.
+- **Item 11 — análise crítica redigida** — insumo completo (robustez do tuning §31 + matriz de confusão + importância de hiperparâmetros + transfer learning vencendo §32). É o próximo passo natural.
+- Seção de abertura com nomes da equipe + declaração de uso de IA generativa.
+- Slides para apresentação oral (12 min, todos falam).
+- Limpeza final: verificar notebook roda em ordem sem erro; markdowns desatualizados (cells 13/26).
 
 ---
 
@@ -166,7 +169,7 @@ Pruner mais sofisticado que aloca orçamento em "rounds" — mais agressivo cort
 | 9 | **Tabela comparativa final** (baseline / Optuna best / vencedor) | ✅ feito (polars, com média ± dp + best_value) |
 | 10 | **Re-treinar baseline para comparação justa** (cf. §29/§31) | ✅ feito + variância N=3 |
 | 11 | **Análise crítica** (overfitting, classes mais confundidas, limitações) | ⚠️ insumo forte (§31 robustez + matriz), falta redigir |
-| 12 | **Item 6 da Lauda — arquitetura clássica** (VGG/ResNet/EfficientNet com transfer learning) | ❌ a fazer |
+| 12 | **Item 6 da Lauda — arquitetura clássica** (EfficientNetB0 transfer learning, feature extraction) | ✅ feito — test_acc 0.9143 |
 
 ### Item 4 da Lauda — entrega
 
